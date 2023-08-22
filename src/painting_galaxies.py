@@ -1,31 +1,37 @@
-import argparse
-import cmasher as cmr
-import gc
-import matplotlib.pyplot as plt
+import h5py
+import scipy
 import os
-import pickle
-import random
-import scipy.spatial
-from scipy.stats import median_abs_deviation
-from sklearn.ensemble import RandomForestRegressor
-import sys
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import SubsetRandomSampler
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader, LinkNeighborLoader, DataLoader, RandomNodeLoader, DynamicBatchSampler
 from torch_geometric.nn import (
     MessagePassing, GCNConv, PPFConv, MetaLayer, EdgeConv,
     global_mean_pool, global_max_pool, global_add_pool
 )
+from torch_geometric.transforms import IndexToMask
 from torch_cluster import radius_graph
 
-from data import *
-from train import *
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import pickle
+import matplotlib.pyplot as plt
+import illustris_python as il
+
+from tqdm import tqdm
+from easyquery import Query
+
+import argparse
+import random
 
 parser = argparse.ArgumentParser(description='Supply aggregation function and whether loops are used.')
 parser.add_argument('--aggr', help='Aggregation function: "sum", "max", or "multi"', required=True, type=str)
 parser.add_argument('--loops', help='Whether to use self-loops: "True" or "False"', required=True, type=int)
+parser.add_argument('--mode', help='Training dark matter versus hydro : "DMO" or "Hydro"', required=True, type=str)
 
 args = parser.parse_args()
 
@@ -49,93 +55,67 @@ revalidate = True
 make_plots = True
 save_models = True
 
-### simulation and selection criteria params
-use_gal = False # gal -> dark matter, or vice versa
-
-
 cuts = {
     "minimum_log_stellar_mass": 9,
-    "minimum_log_halo_mass": 10,
+    "minimum_log_halo_mass": 11,
     "minimum_n_star_particles": 50
 }
 
-snapshot = 99 # z=0
-h = 0.6774    # Planck 2015 cosmology
+# these are global because I'm lazy
+boxsize = (205 / 0.6774)    # box size in comoving kpc/h
+h = 0.6774                  # reduced Hubble constant
+snapshot = 99,              # z = 0
+
+
+normalization_params = dict(
+    norm_half_mass_radius=8., 
+    norm_velocity=100.
+)
 
 ### training and optimization params
-batch_size = 72 # maximum batch_size 
-min_batch_size = 3 # starting batch size (see https://arxiv.org/abs/1711.00489)
-
 training_params = dict(
-    batch_size=batch_size,
+    batch_size=8192,
+    n_epochs=1000,
     learning_rate=1e-2,
     weight_decay=1e-5,
-    n_epochs=1500,
+    betas_adam = (0.9, 0.95),
+    augment=True,
 )
 
 model_params = dict(
+    n_layers=1,
     n_hidden=16,
     n_latent=16,
-    n_layers=1,
     n_unshared_layers=16,
 )
 
-# onecycleschedule_params = dict(
-#     pct_start=0.1, 
-#     div_factor=10,        # warm up
-#     final_div_factor=10, # annealing
-# )
-
-split = 6 # N_subboxes = split**3
-train_test_frac_split = split**2
-
-
-### GNN params
+# GNN params
 undirected = True
-periodic = False
+periodic = True
 
-def make_webs(
-    tng_base_path="../illustris_data/TNG300-1/output", 
-    data_path=None,
-    snapshot=99, 
-    r_link=5,
-    pad=2.5,
-    split=6,
-    cuts=cuts, 
-    use_gal=False, 
-    h=0.6774, 
-    undirected=True, 
-    periodic=False, 
-    use_loops=True,
-    in_projection=False,
-    normalization_params=normalization_params
-):
+
+def load_subhalos(hydro=True, normalization_params=normalization_params, cuts=cuts, snapshot=99):
     
-    if use_gal:
-        # use_cols = ['subhalo_x', 'subhalo_y', 'subhalo_z', 'subhalo_vx', 'subhalo_vy', 'subhalo_vz','subhalo_logstellarmass', 'subhalo_stellarhalfmassradius']
-        use_cols = ['subhalo_x', 'subhalo_y', 'subhalo_z', 'subhalo_vx', 'subhalo_vy', 'subhalo_vz','subhalo_logstellarmass']
-        y_cols = ['subhalo_loghalomass', 'subhalo_logvmax'] 
-    else:
-        use_cols = ['subhalo_x', 'subhalo_y', 'subhalo_z', 'subhalo_vx', 'subhalo_vy', 'subhalo_vz', 'subhalo_loghalomass', 'subhalo_logvmax'] 
-        # y_cols = ['subhalo_logstellarmass', 'subhalo_stellarhalfmassradius']
-        y_cols = ['subhalo_logstellarmass']
+    use_cols = ['subhalo_x', 'subhalo_y', 'subhalo_z', 'subhalo_vx', 'subhalo_vy', 'subhalo_vz', 'subhalo_loghalomass', 'subhalo_logvmax'] 
+    y_cols = ['subhalo_logstellarmass']
 
-    if in_projection:
-        for c in ['subhalo_z', 'subhalo_vx', 'subhalo_vy']:
-            use_cols.remove(c)
+ 
+    base_path = tng_base_path.replace("TNG300-1", "TNG300-1-Dark") if not hydro else tng_base_path
 
     subhalo_fields = [
         "SubhaloPos", "SubhaloMassType", "SubhaloLenType", "SubhaloHalfmassRadType", 
-        "SubhaloVel", "SubhaloVmax", "SubhaloGrNr", "SubhaloFlag"
+        "SubhaloVel", "SubhaloVmax", "SubhaloGrNr", 
     ]
-    subhalos = il.groupcat.loadSubhalos(tng_base_path, snapshot, fields=subhalo_fields) 
+
+    if hydro:
+        subhalo_fields += ["SubhaloFlag"]
+
+    subhalos = il.groupcat.loadSubhalos(base_path, snapshot, fields=subhalo_fields) 
 
     pos = subhalos["SubhaloPos"][:,:3]
-    min_box, max_box = np.rint(np.min(pos)), np.rint(np.max(pos))
-    box_size = max_box/(h*1e3) # in Mpc
 
     halo_fields = ["Group_M_Crit200", "GroupFirstSub", "GroupPos", "GroupVel"]
-    halos = il.groupcat.loadHalos(tng_base_path, snapshot, fields=halo_fields)
+    halos = il.groupcat.loadHalos(base_path, snapshot, fields=halo_fields)
 
     subhalo_pos = subhalos["SubhaloPos"][:] / (h*1e3)
     subhalo_stellarmass = subhalos["SubhaloMassType"][:,4]
@@ -144,7 +124,7 @@ def make_webs(
     subhalo_stellarhalfmassradius = subhalos["SubhaloHalfmassRadType"][:,4]  / normalization_params["norm_half_mass_radius"]
     subhalo_vel = subhalos["SubhaloVel"][:] /  normalization_params["norm_velocity"]
     subhalo_vmax = subhalos["SubhaloVmax"][:] / normalization_params["norm_velocity"]
-    subhalo_flag = subhalos["SubhaloFlag"][:]
+    subhalo_flag = subhalos["SubhaloFlag"][:] if hydro else np.ones_like(subhalo_halomass) # note dummy values of 1 if DMO
     halo_id = subhalos["SubhaloGrNr"][:].astype(int)
 
     halo_mass = halos["Group_M_Crit200"][:]
@@ -158,158 +138,194 @@ def make_webs(
     )
     halos['halo_id'] = halos['halo_id'].astype(int)
     halos.set_index("halo_id", inplace=True)
-
+    
     # get subhalos/galaxies      
     subhalos = pd.DataFrame(
         np.column_stack([halo_id, subhalo_flag, np.arange(len(subhalo_stellarmass)), subhalo_pos, subhalo_vel, subhalo_n_stellar_particles, subhalo_stellarmass, subhalo_halomass, subhalo_stellarhalfmassradius, subhalo_vmax]), 
         columns=['halo_id', 'subhalo_flag', 'subhalo_id', 'subhalo_x', 'subhalo_y', 'subhalo_z', 'subhalo_vx', 'subhalo_vy', 'subhalo_vz', 'subhalo_n_stellar_particles', 'subhalo_stellarmass', 'subhalo_halomass', 'subhalo_stellarhalfmassradius', 'subhalo_vmax'],
     )
     subhalos["is_central"] = (halos.loc[subhalos.halo_id]["halo_primarysubhalo"].values == subhalos["subhalo_id"].values)
+    
+    # DMO-hydro matching
+    if hydro:
+        dmo_hydro_match = h5py.File(f"{ROOT}/illustris_data/TNG300-1/postprocessing/subhalo_matching_to_dark.hdf5")
+        subhalos["subhalo_l_halo_tree"] = dmo_hydro_match["Snapshot_99"]["SubhaloIndexDark_LHaloTree"]
+        subhalos["subhalo_sublink"] = dmo_hydro_match["Snapshot_99"]["SubhaloIndexDark_SubLink"]      
 
-    subhalos = subhalos[subhalos["subhalo_flag"] != 0].copy()
+    # only drop in hydro
+    if hydro:
+        subhalos = subhalos[subhalos["subhalo_flag"] != 0].copy()
     subhalos['halo_id'] = subhalos['halo_id'].astype(int)
     subhalos['subhalo_id'] = subhalos['subhalo_id'].astype(int)
 
-    subhalos.drop("subhalo_flag", axis=1, inplace=True)
-
-    # impose stellar mass and particle cuts
-    subhalos = subhalos[subhalos["subhalo_n_stellar_particles"] > cuts["minimum_n_star_particles"]].copy()
     subhalos["subhalo_logstellarmass"] = np.log10(subhalos["subhalo_stellarmass"] / h)+10
-
     subhalos["subhalo_loghalomass"] = np.log10(subhalos["subhalo_halomass"] / h)+10
     subhalos["subhalo_logvmax"] = np.log10(subhalos["subhalo_vmax"])
     subhalos["subhalo_logstellarhalfmassradius"] = np.log10(subhalos["subhalo_stellarhalfmassradius"])
+        
+    if hydro:
+        # DM cuts
+        subhalos.drop("subhalo_flag", axis=1, inplace=True)
+        subhalos = subhalos[subhalos["subhalo_loghalomass"] > cuts["minimum_log_halo_mass"]].copy()
+        # stellar mass and particle cuts
+        subhalos = subhalos[subhalos["subhalo_n_stellar_particles"] > cuts["minimum_n_star_particles"]].copy()
+        subhalos = subhalos[subhalos["subhalo_logstellarmass"] > cuts["minimum_log_stellar_mass"]].copy()
+    
+    
+    return subhalos
 
-    subhalos = subhalos[subhalos["subhalo_loghalomass"] > cuts["minimum_log_halo_mass"]].copy()
+def prepare_subhalos(dmo_link_method="sublink"):
+    """Helper function to load subhalos, join to DMO simulation, add cosmic web
+    parameters, and impose cuts.
 
-    subhalos = subhalos[subhalos["subhalo_logstellarmass"] > cuts["minimum_log_stellar_mass"]].copy()
+    Note that we force LHaloTree and sublink DMO linking methods to match.
+    """
+    
+    subhalos = load_subhalos()
+    subhalos_dmo = load_subhalos(hydro=False)
 
-    data = []
-    for n in tqdm(range(split), position=0):
-        for g in tqdm(range(split), position=1, leave=False):
-            for k in tqdm(range(split), position=2, leave=False):
-                # print(n,g,k)
-                xlims = np.array([box_size/split*n+pad, box_size/split*(n+1)-pad])
-                ylims = np.array([box_size/split*g+pad, box_size/split*(g+1)-pad])
-                zlims = np.array([box_size/split*k+pad, box_size/split*(k+1)-pad])
 
-                pos = np.vstack(subhalos[['subhalo_x', 'subhalo_y', 'subhalo_z']].to_numpy())
+    valid_idxs_l_halo_tree = subhalos_dmo.index.isin(subhalos.subhalo_l_halo_tree)
+    subhalos_linked = pd.concat(
+        [
+            (
+                subhalos_dmo
+                .loc[subhalos.subhalo_l_halo_tree[subhalos.subhalo_l_halo_tree != -1]]
+                .reset_index(drop=True)
+                .rename({c: c+"_DMO" for c in subhalos_dmo.columns}, axis=1)
+            ),
+            subhalos[subhalos.subhalo_l_halo_tree != -1].reset_index(drop=True),
+        ], 
+        axis=1,
+    )
 
-                xmask = np.logical_and(pos[:,0]>xlims[0],pos[:,0]<xlims[1])
-                ymask = np.logical_and(pos[:,1]>ylims[0],pos[:,1]<ylims[1])
-                zmask = np.logical_and(pos[:,2]>zlims[0],pos[:,2]<zlims[1])
-                mask = np.logical_and(zmask, np.logical_and(xmask, ymask))
+    # force l_halo_tree and sublink to match
+    subhalos_linked = subhalos_linked[subhalos_linked.subhalo_l_halo_tree == subhalos_linked.subhalo_sublink].copy()
+    
+    # join with cosmic web parameters
+    cw = h5py.File(f"{ROOT}/illustris_data/TNG300-1/postprocessing/disperse/disperse_099.hdf5")
+    cw = pd.DataFrame(
+        {k: cw[k] for k in cw.keys()}
+    ).rename({"subhalo_ID": "subhalo_id"}, axis=1).set_index("subhalo_id")
 
-                df = subhalos.iloc[mask].copy()
-                df.reset_index(drop=True)
+    cw_normalization = dict(mean=cw.mean(0), std=cw.std(0))
+    cw = (cw - cw_normalization["mean"]) / cw_normalization["std"]
 
-                # remove extraneous columns
-                df.drop(["subhalo_n_stellar_particles", "subhalo_stellarmass", "subhalo_halomass"], axis=1, inplace=True)
+    subhalos_linked = subhalos_linked.join(cw, on="subhalo_id", how="left")
+    
+    # reiterate halo mass cuts just in case DMO masses are different...
+    subhalos_linked = subhalos_linked[subhalos_linked.subhalo_loghalomass_DMO > cuts["minimum_log_halo_mass"]].copy()
 
-                # set new zero point
+    return subhalos_linked
 
-                df[['subhalo_x', 'subhalo_y', 'subhalo_z']] = df[['subhalo_x', 'subhalo_y', 'subhalo_z']] - np.array([box_size/split*n+pad, box_size/split*g+pad, box_size/split*k+pad])
+def make_cosmic_graph(subhalos):
+    df = subhalos.copy()
+    df.reset_index(drop=True)
 
-                #make positions for clustering
+    # DMO only properties
+    x = torch.tensor(df[['subhalo_loghalomass_DMO', 'subhalo_logvmax_DMO']].values, dtype=torch.float)
 
-                if in_projection:
-                    pos = np.vstack(df[['subhalo_x', 'subhalo_y']].to_numpy())    
-                else:
-                    pos = np.vstack(df[['subhalo_x', 'subhalo_y', 'subhalo_z']].to_numpy())
+    # hydro properties
+    x_hydro = torch.tensor(df[["subhalo_loghalomass", 'subhalo_logvmax']].values, dtype=torch.float)
 
-                kd_tree = scipy.spatial.KDTree(pos, leafsize=25, boxsize=box_size)
-                edge_index = kd_tree.query_pairs(r=r_link, output_type="ndarray")
+    # hydro total stellar mass
+    y = torch.tensor(df[['subhalo_logstellarmass']].values, dtype=torch.float)
 
-                # normalize positions
+    # phase space coordinates
+    pos = torch.tensor(df[['subhalo_x_DMO', 'subhalo_y_DMO', 'subhalo_z_DMO']].values, dtype=torch.float)
+    vel = torch.tensor(df[['subhalo_vx_DMO', 'subhalo_vy_DMO', 'subhalo_vz_DMO']].values, dtype=torch.float)
 
-                df[['subhalo_x', 'subhalo_y', 'subhalo_z']] = df[['subhalo_x', 'subhalo_y', 'subhalo_z']]/(box_size/2)
+    pos_hydro = torch.tensor(df[['subhalo_x', 'subhalo_y', 'subhalo_z']].values, dtype=torch.float)
+    vel_hydro = torch.tensor(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].values, dtype=torch.float)
 
-                if undirected:
-                # Add reverse pairs
-                    reversepairs = np.zeros((edge_index.shape[0],2))
-                    for i, pair in enumerate(edge_index):
-                        reversepairs[i] = np.array([pair[1], pair[0]])
-                    edge_index = np.append(edge_index, reversepairs, 0)
+    is_central = torch.tensor(df[['is_central']].values, dtype=torch.int)
+    halfmassradius = torch.tensor(df[['subhalo_logstellarhalfmassradius']].values, dtype=torch.float)
 
-                    edge_index = edge_index.astype(int)
+    # make links
+    kd_tree = scipy.spatial.KDTree(pos, leafsize=25, boxsize=boxsize)
+    edge_index = kd_tree.query_pairs(r=D_link, output_type="ndarray")
 
-                    # Write in pytorch-geometric format
-                    edge_index = edge_index.reshape((2,-1))
-                    num_pairs = edge_index.shape[1]
+    # normalize positions
+    df[['subhalo_x', 'subhalo_y', 'subhalo_z']] = df[['subhalo_x', 'subhalo_y', 'subhalo_z']]/(boxsize/2)
 
-                row, col = edge_index
+    # Add reverse pairs
+    reversepairs = np.zeros((edge_index.shape[0], 2))
+    for i, pair in enumerate(edge_index):
+        reversepairs[i] = np.array([pair[1], pair[0]])
+    edge_index = np.append(edge_index, reversepairs, 0)
 
-                diff = pos[row]-pos[col]
-                dist = np.linalg.norm(diff, axis=1)
+    edge_index = edge_index.astype(int)
 
-                use_gal = True
+    # Write in pytorch-geometric format
+    edge_index = edge_index.reshape((2,-1))
+    num_pairs = edge_index.shape[1]
 
-                if periodic:
-                    # Take into account periodic boundary conditions, correcting the distances
-                    for i, pos_i in enumerate(diff):
-                        for j, coord in enumerate(pos_i):
-                            if coord > r_link:
-                                diff[i,j] -= box_size  # Boxsize normalize to 1
-                            elif -coord > r_link:
-                                diff[i,j] += box_size  # Boxsize normalize to 1
+    row, col = edge_index
 
-                centroid = np.mean(pos,axis=0) # define arbitrary coordinate, invarinat to translation/rotation shifts, but not stretches
-                # centroid+=1.2
+    diff = pos[row]-pos[col]
+    dist = np.linalg.norm(diff, axis=1)
 
-                unitrow = (pos[row]-centroid)/np.linalg.norm((pos[row]-centroid), axis=1).reshape(-1,1)
-                unitcol = (pos[col]-centroid)/np.linalg.norm((pos[col]-centroid), axis=1).reshape(-1,1)
-                unitdiff = diff/dist.reshape(-1,1)
-                # Dot products between unit vectors
-                cos1 = np.array([np.dot(unitrow[i,:].T,unitcol[i,:]) for i in range(num_pairs)])
-                cos2 = np.array([np.dot(unitrow[i,:].T,unitdiff[i,:]) for i in range(num_pairs)])
+    use_gal = True
 
-                # same invariant edge features but for velocity
-                vel = np.vstack(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].to_numpy())
-                vel_diff = vel[row]-vel[col]
-                vel_norm = np.linalg.norm(vel_diff, axis=1)
-                vel_centroid = np.mean(vel)
+    if periodic:
+        # Take into account periodic boundary conditions, correcting the distances
+        for i, pos_i in enumerate(diff):
+            for j, coord in enumerate(pos_i):
+                if coord > D_link:
+                    diff[i,j] -= boxsize  # Boxsize normalize to 1
+                elif -coord > D_link:
+                    diff[i,j] += boxsize  # Boxsize normalize to 1
 
-                vel_unitrow = (vel[row]-vel_centroid)/np.linalg.norm(vel[row]-vel_centroid, axis=1).reshape(-1, 1)
-                vel_unitcol = (vel[col]-vel_centroid)/np.linalg.norm(vel[col]-vel_centroid, axis=1).reshape(-1, 1)
-                vel_unitdiff = vel_diff / vel_norm.reshape(-1,1)
-                vel_cos1 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitcol[i,:]) for i in range(num_pairs)])
-                vel_cos2 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitdiff[i,:]) for i in range(num_pairs)])
+    centroid = np.array(pos.mean(0)) # define arbitrary coordinate, invarinat to translation/rotation shifts, but not stretches
+    # centroid+=1.2
 
-                edge_attr = np.concatenate([dist.reshape(-1,1), cos1.reshape(-1,1), cos2.reshape(-1,1), vel_norm.reshape(-1,1), vel_cos1.reshape(-1,1), vel_cos2.reshape(-1,1)], axis=1)
+    unitrow = (pos[row]-centroid)/np.linalg.norm((pos[row]-centroid), axis=1).reshape(-1,1)
+    unitcol = (pos[col]-centroid)/np.linalg.norm((pos[col]-centroid), axis=1).reshape(-1,1)
+    unitdiff = diff/dist.reshape(-1,1)
+    # Dot products between unit vectors
+    cos1 = np.array([np.dot(unitrow[i,:].T,unitcol[i,:]) for i in range(num_pairs)])
+    cos2 = np.array([np.dot(unitrow[i,:].T,unitdiff[i,:]) for i in range(num_pairs)])
 
-                if use_loops:
-                    loops = np.zeros((2,pos.shape[0]),dtype=int)
-                    atrloops = np.zeros((pos.shape[0], edge_attr.shape[1]))
-                    for i, posit in enumerate(pos):
-                        loops[0,i], loops[1,i] = i, i
-                        atrloops[i,0], atrloops[i,1], atrloops[i,2] = 0., 1., 0.
-                    edge_index = np.append(edge_index, loops, 1)
-                    edge_attr = np.append(edge_attr, atrloops, 0)
-                edge_index = edge_index.astype(int)
+    # same invariant edge features but for velocity
+    vel = np.vstack(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].to_numpy())
+    vel_diff = vel[row]-vel[col]
+    vel_norm = np.linalg.norm(vel_diff, axis=1)
+    vel_centroid = np.array(vel.mean(0))
 
-                x = torch.tensor(np.vstack(df[use_cols[-2:]].to_numpy()), dtype=torch.float) # don't use positions or velocities
-                y = torch.tensor(np.vstack(df[y_cols].to_numpy()), dtype=torch.float)
-                edge_index = torch.tensor(edge_index, dtype=torch.long)
-                edge_attr=torch.tensor(edge_attr, dtype=torch.float)
-                pos = torch.tensor(pos, dtype=torch.float)
-                is_central = torch.tensor(df.is_central.values, dtype=bool)
-                overdensity = torch.zeros(len(x), dtype=x.dtype)
-                for i in range(len(x)):
-                    neighbors = edge_index[1, edge_index[0] == i] # get neighbor indices
-                    overdensity[i] = torch.log10((10**x[neighbors, -2]).sum()) # get sum of masses of neighbors (2nd to last index in `x`)
+    vel_unitrow = (vel[row]-vel_centroid)/np.linalg.norm(vel[row]-vel_centroid, axis=1).reshape(-1, 1)
+    vel_unitcol = (vel[col]-vel_centroid)/np.linalg.norm(vel[col]-vel_centroid, axis=1).reshape(-1, 1)
+    vel_unitdiff = vel_diff / vel_norm.reshape(-1,1)
+    vel_cos1 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitcol[i,:]) for i in range(num_pairs)])
+    vel_cos2 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitdiff[i,:]) for i in range(num_pairs)])
 
-                data.append(Data(x=x, y=y, pos=pos, is_central=is_central, edge_index=edge_index, edge_attr=edge_attr, overdensity=overdensity))
+    # build edge features
+    edge_attr = np.concatenate([dist.reshape(-1,1), cos1.reshape(-1,1), cos2.reshape(-1,1), vel_norm.reshape(-1,1), vel_cos1.reshape(-1,1), vel_cos2.reshape(-1,1)], axis=1)
 
-                proj_str = "-projected" if in_projection else ""
+    if use_loops:
+        loops = np.zeros((2,pos.shape[0]),dtype=int)
+        atrloops = np.zeros((pos.shape[0], edge_attr.shape[1]))
+        for i, posit in enumerate(pos):
+            loops[0,i], loops[1,i] = i, i
+            atrloops[i,0], atrloops[i,1], atrloops[i,2] = 0., 1., 0.
+        edge_index = np.append(edge_index, loops, 1)
+        edge_attr = np.append(edge_attr, atrloops, 0)
+    edge_index = edge_index.astype(int)
 
-                if data_path is None:
-                    data_path = os.path.join(tng_base_path, 'cosmic_graphs', f'split_{split**3}_link_{int(r_link)}_pad{int(pad)}_gal{int(use_gal)}{proj_str}.pkl')
+    data = Data(
+        x=x,
+        edge_index=torch.tensor(edge_index, dtype=torch.long),
+        edge_attr=torch.tensor(edge_attr, dtype=torch.float),
+        y=y,
+        pos=pos,
+        vel=vel,
+        is_central=is_central,
+        x_hydro=x_hydro,
+        pos_hydro=pos_hydro,
+        vel_hydro=vel_hydro,
+        halfmassradius=halfmassradius
+    )
 
-                if not os.path.isdir(os.path.join(tng_base_path, 'cosmic_graphs')):
-                    os.mkdir(os.path.join(tng_base_path, 'cosmic_graphs'))
-
-                with open(data_path, 'wb') as handle:
-                    pickle.dump(data, handle)
+    return data
 
                     
 def visualize_graph(data, draw_edges=True, projection="3d", edge_index=None, boxsize=302.6, fontsize=12, results_path=None):
@@ -332,9 +348,9 @@ def visualize_graph(data, draw_edges=True, projection="3d", edge_index=None, box
             src = pos[src].tolist()
             dst = pos[dst].tolist()
             if projection=="3d":
-                ax.plot([src[0], dst[0]], [src[1], dst[1]], zs=[src[2], dst[2]], linewidth=0.2/r_link, color='black')
+                ax.plot([src[0], dst[0]], [src[1], dst[1]], zs=[src[2], dst[2]], linewidth=0.2/D_link, color='black')
             elif projection=="2d":
-                ax.plot([src[0], dst[0]], [src[1], dst[1]], linewidth=0.2/r_link, color='black')
+                ax.plot([src[0], dst[0]], [src[1], dst[1]], linewidth=0.2/D_link, color='black')
 
     # Plot nodes
     if projection=="3d":
@@ -482,177 +498,118 @@ class EdgeInteractionGNN(nn.Module):
 
 
                     
-        
-def train_cosmic_gnn(data, k, split=6, r_link=5, aggr="sum", 
-    use_loops=True, in_projection=False, make_plots=True, results_path=None, 
-    hidden_channels=256, latent_channels=128, n_layers=1, n_unshared_layers=1
-):
-    """Trains GNN using global optimization params"""    
-    proj_str = "-projected" if in_projection else ""
-    
-    print(f"Begin training{proj_str}")
-    
-    
-    gc.collect();
-    print(f"Training fold {k+1}/{split}" + "\n")
-    
-    node_features = data[0].x.shape[1]
-    edge_features = data[0].edge_attr.shape[1]
-    out_features = data[0].y.shape[1]
+def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e-10):
+    """k must be between `range(0, K)`. 
 
-    model = EdgeInteractionGNN(
-        node_features=node_features,
-        edge_features=edge_features, 
-        n_layers=n_layers, 
-        D_link=r_link,
-        hidden_channels=hidden_channels,
-        latent_channels=latent_channels,
-        loop=use_loops,
-        n_unshared_layers=n_unshared_layers,
-        use_global_pooling=False,
-        n_out=out_features,
-        aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
+    `boxsize` and `pad` are both in units of Mpc, and it is assumed that the 
+    `data` object has attribute `pos` of shape (N_rows, 3) also in units of Mpc.
+
+    `epsilon` is there so that the modular division doesn't cause the boolean
+    logic to wrap around.
+    """
+
+    # use z coordinate for train-valid split
+    train_1_mask = (
+        (data.pos[:, 2]  > ((k) / K * boxsize + pad) % boxsize) 
+        & (data.pos[:, 2] <= ((k + 1) / K * boxsize - epsilon) % boxsize)
     )
 
-    model.to(device);
-
-    # assumes that data is a list of PyG Data objects, otherwise this will fail
-    data_train = data[:k*train_test_frac_split] + data[(k+1)*train_test_frac_split:]
-    data_valid = data[k*train_test_frac_split:(k+1)*train_test_frac_split]
-
-    # use variable batch size
-    # train_loader = DataLoader(data_train, batch_size=batch_size, shuffle=True)
-    valid_loader = DataLoader(data_valid, batch_size=batch_size, shuffle=False)
-
-    print("Epoch    train loss   valid loss   RMSE   avg std")
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=training_params["learning_rate"], 
-        weight_decay=training_params["weight_decay"],
-        betas=(0.9, 0.95),
+    train_2_mask = (
+        (data.pos[:, 2]  > ((k + 1)/ K * boxsize) % boxsize) 
+        & (data.pos[:, 2] <= ((k + 2) / K * boxsize - pad) % boxsize)
     )
-    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    #     optimizer, 
-    #     max_lr=training_params["learning_rate"], 
-    #     total_steps=len(train_loader)*training_params["n_epochs"]+1,
-    #     pct_start=onecycleschedule_params["pct_start"], 
-    #     div_factor=onecycleschedule_params["div_factor"],     
-    #     final_div_factor=onecycleschedule_params["final_div_factor"] 
-    # )
 
-    train_losses = []
-    valid_losses = []
-    for epoch in range(training_params["n_epochs"]):
-        # change batch size over time
-        scheduled_batch_size = max(min_batch_size, int(np.round(batch_size * epoch / training_params["n_epochs"])))
-        train_loader = DataLoader(data_train, batch_size=scheduled_batch_size, shuffle=True)
+    valid_mask = (
+        (data.pos[:, 2] > ((k + 2) / K * boxsize) % boxsize)
+        & (data.pos[:, 2] <= ((k + 3) / K * boxsize - epsilon) % boxsize)
+    )
 
-        train_loss = train(train_loader, model, optimizer, device, in_projection=in_projection)
-        valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device, in_projection=in_projection)
-        # scheduler.step()
+    # this is the weird pytorch way of doing `np.argwhere`
+    train_indices = (train_1_mask  | train_2_mask).nonzero(as_tuple=True)[0] 
 
-        train_losses.append(train_loss)
-        valid_losses.append(valid_loss)
+    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+
+    # ensure zero overlap
+    assert (set(train_indices) & set(valid_indices)) == set()
+
+    return train_indices, valid_indices
 
 
-        if (epoch + 1) % 10 == 0:
-            print(f" {epoch + 1: >4d}      {train_loss: >6.2f}       {valid_loss: >6.2f}    {np.sqrt(np.mean((p - y.flatten())**2)): >6.3f}  {np.mean(valid_std): >6.3f}")
+def train(dataloader, model, optimizer, device, augment=True):
+    """Assumes that data object in dataloader has 8 columns: x,y,z, vx,vy,vz, Mh, Vmax"""
+    model.train()
 
-    if make_plots:
-        plt.figure(figsize=(6, 3), dpi=150)
-        plt.plot(train_losses, c=c0, label="Train")
-        plt.plot(valid_losses, c=c3, label="Valid")
-        plt.legend()
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.grid(alpha=0.15)
-        plt.ylim(plt.ylim()[0], min(plt.ylim()[1], -2))
-        plt.tight_layout()
+    loss_total = 0
+    for data in (dataloader):
+        if augment: # add random noise
+            data_node_features_scatter = 4e-3 * torch.randn_like(data.x) * torch.std(data.x, dim=0)
+            data_edge_features_scatter = 4e-3 * torch.randn_like(data.edge_attr) * torch.std(data.edge_attr, dim=0)
+            
+            data.x += data_node_features_scatter
+            data.edge_attr += data_edge_features_scatter
 
-        plt.savefig(f"{results_path}/training-logs/losses{proj_str}-fold{k+1}.png")
+        data.to(device)
 
-    if save_models:
-        torch.save(
-            model.state_dict(),
-            f"{results_path}/models/EdgePointGNN-link{r_link}-hidden{hidden_channels}-latent{latent_channels}-selfloops{int(use_loops)}-agg{aggr}-epochs{training_params['n_epochs']}{proj_str}_fold{k+1}.pth", 
-        )
-        plt.close()
-    return model
+        optimizer.zero_grad()
+        y_pred, logvar_pred = model(data).chunk(2, dim=1)
+        y_pred = y_pred.view(-1, model.n_out)
+        logvar_pred = logvar_pred.view(-1, model.n_out)
 
-def validate_cosmic_gnn(model, data, k, split=6, in_projection=False, make_plots=True, results_path=None):
-    """Validates and compares GNN model against RF models"""
-    data_train = data[:k*train_test_frac_split] + data[(k+1)*train_test_frac_split:]
-    data_valid = data[k*train_test_frac_split:(k+1)*train_test_frac_split]
+        # compute loss as sum of two terms for likelihood-free inference
+        loss_mse = F.mse_loss(y_pred, data.y)
+        loss_lfi = F.mse_loss((y_pred - data.y)**2, 10**logvar_pred)
 
-    train_loader = DataLoader(data_train, batch_size=batch_size, shuffle=True)
-    valid_loader = DataLoader(data_valid, batch_size=batch_size, shuffle=False)
+        loss = torch.log(loss_mse) + torch.log(loss_lfi)
+
+        loss.backward()
+        optimizer.step()
+        loss_total += loss.item()
+
+    return loss_total / len(dataloader)
+
+
+def validate(dataloader, model, device):
+    model.eval()
+
+    uncertainties = []
+    loss_total = 0
+
+    y_preds = []
+    y_trues = []
+    logvar_preds = []
+
+    for data in (dataloader):
+        with torch.no_grad():
+            data.to(device)
+            y_pred, logvar_pred = model(data).chunk(2, dim=1)
+            y_pred = y_pred.view(-1, model.n_out)
+            logvar_pred = logvar_pred.view(-1, model.n_out)
+            uncertainties.append(np.sqrt(10**logvar_pred.detach().cpu().numpy()).mean(-1))
+
+            # compute loss as sum of two terms a la Moment Networks (Jeffrey & Wandelt 2020)
+            loss_mse = F.mse_loss(y_pred, data.y)
+            loss_lfi = F.mse_loss((y_pred - data.y)**2, 10**logvar_pred)
+
+            loss = torch.log(loss_mse) + torch.log(loss_lfi)
+
+            loss_total += loss.item()
+            y_preds += list(y_pred.detach().cpu().numpy())
+            y_trues += list(data.y.detach().cpu().numpy())
+            logvar_preds += list(logvar_pred.detach().cpu().numpy())
+
+    y_preds = np.concatenate(y_preds)
+    y_trues = np.array(y_trues)
+    logvar_preds = np.concatenate(logvar_preds)
+    uncertainties = np.concatenate(uncertainties)
+
+    return (
+        loss_total / len(dataloader),
+        np.mean(uncertainties, -1),
+        y_preds,
+        y_trues,
+        logvar_preds
+    )
     
-    # actually validate model
-    _, _, p_valid, y_valid, logvar_p = validate(valid_loader, model, device)
-    p_valid = p_valid.reshape((-1, 1))
-    y_valid = y_valid[:, 0]
-    
-
-    X_train = np.concatenate([d.x for d in data_train]).reshape((-1, 2))
-    y_train = np.concatenate([d.y[:, 0] for d in data_train])
-    
-    X_valid = np.concatenate([d.x for d in data_valid])
-
-    # compare against random forest models
-    print("Comparing against random forest models")
-
-    # case one: Vmax
-    X_train_Vmax = np.concatenate([d.x[:, -1] for d in data_train]).reshape((-1, 1))
-    y_train = np.concatenate([d.y[:, 0] for d in data_train])
-
-    rf_Vmax = RandomForestRegressor()
-    rf_Vmax.fit(X_train_Vmax, y_train)
-    X_valid_Vmax = np.concatenate([d.x[:, -1] for d in data_valid]).reshape((-1, 1))
-    p_log_Mstar_rf_Vmax = rf_Vmax.predict(X_valid_Vmax)
-
-    # case two: Mhalo
-    X_train_Mh = np.concatenate([d.x[:, -2] for d in data_train]).reshape((-1, 1))
-    y_train = np.concatenate([d.y[:, 0] for d in data_train])
-
-    rf_Mh = RandomForestRegressor()
-    rf_Mh.fit(X_train_Mh, y_train)
-    X_valid_Mh = np.concatenate([d.x[:, -2] for d in data_valid]).reshape((-1, 1))
-    p_log_Mstar_rf_Mh = rf_Mh.predict(X_valid_Mh)
-
-    # case three: Vmax+Mhalo
-    X_train_MhVmax = np.concatenate([d.x for d in data_train]).reshape((-1, 2))
-    y_train = np.concatenate([d.y[:, 0] for d in data_train])
-
-    rf_MhVmax = RandomForestRegressor()
-    rf_MhVmax.fit(X_train_MhVmax, y_train)
-    X_valid_MhVmax = np.concatenate([d.x for d in data_valid]).reshape((-1, 2))
-    p_log_Mstar_rf_MhVmax = rf_MhVmax.predict(X_valid_MhVmax)
-
-    # case four: Vmax+Mhalo+delta_X
-    X_train_overdensity = np.concatenate([torch.hstack([d.x, d.overdensity.view(-1, 1)]) for d in data_train], 0)
-    rf_overdensity = RandomForestRegressor()
-    rf_overdensity.fit(X_train_overdensity, y_train)
-    X_valid_overdensity = np.concatenate([torch.hstack([d.x, d.overdensity.view(-1, 1)]) for d in data_valid], 0)
-    p_log_Mhalo_rf_overdensity = rf_overdensity.predict(X_valid_overdensity)
-
-    p_gnn_key = "p_GNN_2d" if in_projection else "p_GNN_3d" 
-    overdensity_key = f"delta_{r_link}"
-    df = pd.DataFrame({
-        "log_Mhalo": X_valid_overdensity[:, 0].flatten(),
-        "log_Vmax": X_valid_overdensity[:, 1].flatten(),
-        overdensity_key: X_valid_overdensity[:, 2].flatten(),
-        "log_Mstar": y_valid.flatten(),
-        "p_RF_Mhalo": p_log_Mstar_rf_Mh.flatten(),
-        "p_RF_Vmax": p_log_Mstar_rf_Vmax.flatten(),
-        "p_RF_MhVmax": p_log_Mstar_rf_MhVmax.flatten(),
-        "p_RF_overdensity": p_log_Mhalo_rf_overdensity.flatten(),
-        p_gnn_key: p_valid.flatten(),
-    })
-
-    proj_str = "-projected" if in_projection else ""
-    df.to_csv(f"{results_path}/validation{proj_str}-fold{k+1}.csv", index=False)
-     
 
 def combine_results(split=6, centrals=None, results_path=None):
     """Combine all results, including 3d and 2d GNN"""
@@ -701,20 +658,17 @@ def save_metrics(df, results_path=None):
         f.write("RF - $M_{\\rm halo}+V_{\\rm max}$ & 2 & " + " & ".join([f"{m:.3f}" for m in metrics_MhVmax]) + "\\\\" + "\n")
 
         metrics_overdensity = get_metrics(df.p_RF_overdensity, df.log_Mstar)
-        f.write("RF - $M_{\\rm halo}+V_{\\rm max}+" + f"\\delta_{r_link}$ & 2 & " + " & ".join([f"{m:.3f}" for m in metrics_overdensity]) + "\\\\" + "\n")
+        f.write("RF - $M_{\\rm halo}+V_{\\rm max}+" + f"\\delta_{D_link}$ & 2 & " + " & ".join([f"{m:.3f}" for m in metrics_overdensity]) + "\\\\" + "\n")
 
-        # metrics_GNN_proj = get_metrics(df.p_GNN_2d, df.log_Mstar)
-        # f.write("GNN ($2d$ projection) & 5 & " + " & ".join([f"{m:.3f}" for m in metrics_GNN_proj]) + "\\\\" + "\n")
-
-        metrics_GNN = get_metrics(df.p_GNN_3d, df.log_Mstar)
-        f.write("\\bf GNN $\\bm{(3d)}$ & 8 & \\bf " + " & \\bf ".join([f"{m:.3f}" for m in metrics_GNN]) + "\\\\" + "\n")
+        metrics_GNN = get_metrics(df.p_GNN, df.log_Mstar)
+        f.write("\\bf GNN & 8 & \\bf " + " & \\bf ".join([f"{m:.3f}" for m in metrics_GNN]) + "\\\\" + "\n")
         
         if "is_central" in df.columns:
 
-            metrics_GNN_centrals = get_metrics(df[df.is_central].p_GNN_3d, df[df.is_central].log_Mstar)
+            metrics_GNN_centrals = get_metrics(df[df.is_central].p_GNN, df[df.is_central].log_Mstar)
             f.write("GNN $(3d)$ - centrals & 8 & " + " & ".join([f"{m:.3f}" for m in metrics_GNN_centrals]) + "\\\\"+ "\n")
 
-            metrics_GNN_satellites = get_metrics(df[~df.is_central].p_GNN_3d, df[~df.is_central].log_Mstar)
+            metrics_GNN_satellites = get_metrics(df[~df.is_central].p_GNN, df[~df.is_central].log_Mstar)
             f.write("GNN $(3d)$ - satellites & 8 & " + " & ".join([f"{m:.3f}" for m in metrics_GNN_satellites]) + "\\\\"+ "\n")
     
 def plot_comparison_figure(df, results_path=None):
@@ -762,7 +716,7 @@ def plot_comparison_figure(df, results_path=None):
 
     
 def main(
-    r_link, aggr, use_loops,
+    D_link, aggr, use_loops, mode, K=3,
     n_hidden=model_params["n_hidden"],
     n_latent=model_params["n_latent"],
     n_layers=model_params["n_layers"],
@@ -770,109 +724,146 @@ def main(
 ):
     """Run the full pipeline"""
 
-    results_path = f"{ROOT}/results/predicting-Mstar/gnns-upgraded_{aggr}_loops-{int(use_loops)}/r_link{r_link}"
+    results_path = f"{ROOT}/results/linking_length_tests/D_link{D_link}"
     
     # make paths in case they don't exist
     Path(f"{results_path}/data").mkdir(parents=True, exist_ok=True)
-    Path(f"{results_path}/training-logs").mkdir(parents=True, exist_ok=True)
+    Path(f"{results_path}/logs").mkdir(parents=True, exist_ok=True)
     Path(f"{results_path}/models").mkdir(parents=True, exist_ok=True)
     
-
-    
-    pad = 5 # r_link / 2
-    
     if not os.path.isfile(f"{results_path}/cross-validation.csv") or recompile_data or retrain or revalidate:
-        for in_projection in [False]:
-            import gc; gc.collect()
-            proj_str = "-projected" if in_projection else ""
+        import gc; gc.collect()
 
-            data_path = f"{results_path}/data/" + f'gal2halo_split_{split**3}_link_{int(r_link)}_pad{int(pad)}_gal0{proj_str}.pkl'
+        # get DMO & hydro linked catalogs with all cuts
+        catalog_path = f"{results_path}/data/subhalos_DMO-matched.parquet"
+        if os.path.isfile(catalog_path) and not recompile_data:
+            subhalos = pd.read_parquet(catalog_path)
+        else:
+            subhalos = prepare_subhalos()
+            subhalos.to_parquet(catalog_path)
 
-            if os.path.isfile(data_path) and not recompile_data:
-                print('File already exists: ', end='')
-            else:
-                print('Remaking dataset: ', end='')
-                make_webs(
-                    tng_base_path=tng_base_path, 
-                    data_path=data_path,
-                    snapshot=snapshot, 
-                    r_link=r_link, 
-                    pad=pad, 
-                    split=split,
-                    cuts=cuts, 
-                    h=h, 
-                    undirected=undirected, 
-                    periodic=periodic,
-                    use_loops=use_loops, 
-                    in_projection=in_projection,
-                )
+        # make cosmic graphs
+        data_path = f"{results_path}/data/cosmic_graphs.pkl"
+        if os.path.isfile(data_path) and not recompile_data:
+            with open(data_path, "rb") as data_file:
+                data = pickle.load(data_file)
+        else:
+            data = make_cosmic_graph(subhalos)
+            with open(data_path, "wb") as data_file:
+                pickle.dump(data, data_file)
 
-            print(data_path)
-            data = pickle.load(open(data_path, 'rb'))
+        if mode.lower() == "hydro":
+            data_hydro = data.clone()
+            x, pos, vel = data.x, data.pos, data.vel
+            x_hydro, pos_hydro, vel_hydro = data.x_hydro, data.pos_hydro, data.vel_hydro
+            data_hydro.x = torch.cat((x_hydro, data.is_central.type(torch.float)), dim=-1)
+            data_hydro.pos = pos_hydro
+            data_hydro.vel = vel_hydro
+            data = data_hydro
+        else:
+            data.x = torch.cat((data.x, data.is_central.type(torch.float)), dim=-1)
 
-            # retrain all data
-            for k in range(split): 
-                if retrain or not os.path.isfile(f"{results_path}/validation{proj_str}-fold{k+1}.csv"):
-                    print("Training!")
-                    model = train_cosmic_gnn(
-                        data, k=k, r_link=r_link, aggr=aggr, use_loops=use_loops, split=split, in_projection=in_projection, make_plots=make_plots, results_path=results_path, hidden_channels=n_hidden, latent_channels=n_latent, n_layers=n_layers
+        # training
+        node_features = data.x.shape[1]
+        edge_features = data.edge_attr.shape[1]
+        out_features = data.y.shape[1]
+
+        lr = training_params["learning_rate"]
+        wd = training_params["weight_decay"]
+        betas_adam = training_params["betas_adam"]
+        batch_size = training_params["batch_size"]
+        n_epochs = training_params["n_epochs"]
+
+        model = EdgeInteractionGNN(
+            node_features=node_features,
+            edge_features=edge_features, 
+            n_layers=n_layers, 
+            D_link=D_link,
+            hidden_channels=n_hidden,
+            latent_channels=n_latent,
+            loop=use_loops,
+            n_unshared_layers=n_unshared_layers,
+            n_out=out_features,
+            aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
+        )
+        model.to(device)
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=lr, 
+            weight_decay=wd,
+            betas=betas_adam,
+        )
+
+        for k in range(K):
+            train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
+
+            train_sampler = SubsetRandomSampler(train_indices)
+            valid_sampler = SubsetRandomSampler(valid_indices)
+
+            
+            valid_loader = RandomNodeLoader(
+                data,
+                num_parts=(len(valid_indices) // batch_size),
+                sampler=valid_sampler
+            )
+
+            # training log
+            train_losses = []
+            valid_losses = []
+            with open(f'{results_path}/logs/training-{mode}.log', 'a') as f:
+                for epoch in range(n_epochs):
+
+                    train_loader = RandomNodeLoader(
+                        data,
+                        num_parts=len(train_indices) // batch_size,
+                        sampler=train_sampler
                     )
-                    validate_cosmic_gnn(model, data, k=k, split=split, in_projection=in_projection, make_plots=make_plots, results_path=results_path)
-                elif revalidate and os.path.isfile(f"{results_path}/validation_{proj_str}-fold{k+1}.csv"):
-                    gc.collect();
 
-                    node_features = data[0].x.shape[1]
-                    out_features = data[0].y.shape[1]
+                    if epoch == int(n_epochs * 0.5):
+                        optimizer = torch.optim.AdamW(
+                            model.parameters(), 
+                            lr=lr / 5, 
+                            weight_decay=wd,
+                            betas=betas_adam,
+                        )
+                    elif epoch == (n_epochs * 0.75):
+                        optimizer = torch.optim.AdamW(
+                            model.parameters(), 
+                            lr=lr / 25, 
+                            weight_decay=wd,
+                            betas=betas_adam,
+                        )
 
-                    model = EdgePointGNN(
-                        node_features=node_features, 
-                        n_layers=n_layers, 
-                        n_unshared_layers=n_unshared_layers,
-                        D_link=r_link,
-                        hidden_channels=n_hidden,
-                        latent_channels=n_latent,
-                        loop=use_loops,
-                        use_global_pooling=False,
-                        n_out=out_features,
-                        aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
-                    )
+                    train_loss = train(train_loader, model, optimizer, device)
+                    valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
 
-                    model.to(device);
-                    model.load_state_dict(torch.load(f"{results_path}/models/EdgePointGNN-link{r_link}-hidden256-latent128-selfloops1-agg{aggr}-epochs1000_fold{k+1}.pth"))
-                    validate_cosmic_gnn(model, data, k=k, split=split, in_projection=in_projection)
-                else:
-                    print("Loaded 3d data, skipping projected version")
-                    break
+                    train_losses.append(train_loss)
+                    valid_losses.append(valid_loss)
 
+                    f.write(f" {epoch + 1: >4d}    {train_loss: >7.3f}    {valid_loss: >7.3f}    {np.sqrt(np.mean((p - y.flatten())**2)): >7.4f}  {np.mean(valid_std): >7.4f}\n")
+                    f.flush()
 
-        # keep track of which are centrals/sats
-        is_central = np.concatenate([d.is_central for d in data])
+            torch.save(model.state_dict(), f"{ROOT}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt")
 
-        # combine results together and write outputs
-        results = combine_results(split=split, centrals=is_central, results_path=results_path)
-    else:
-        print("Loading previous results (if you want to refresh the results, set retrain=True and/or revalidate=True)")
-        results = pd.read_csv(f"{results_path}/cross-validation.csv")
+    #     # keep track of which are centrals/sats
+    #     is_central = np.concatenate([d.is_central for d in data])
+
+    #     # combine results together and write outputs
+    #     results = combine_results(split=split, centrals=is_central, results_path=results_path)
+    # else:
+    #     print("Loading previous results (if you want to refresh the results, set retrain=True and/or revalidate=True)")
+    #     results = pd.read_csv(f"{results_path}/cross-validation.csv")
     
-    print("Saved out metrics in LaTeX table format")
-    save_metrics(results, results_path=results_path)
+    # print("Saved out metrics in LaTeX table format")
+    # save_metrics(results, results_path=results_path)
     
-    # if make_plots:
-    #     print("Visualizing graphs")
-    #     for in_projection in [True, False]:
-    #         proj_str = "-projected" if in_projection else ""
-    #         data_path = f"{results_path}/data/" + f'gal2halo_split_{split**3}_link_{int(r_link)}_pad{int(pad)}_gal0{proj_str}.pkl'
-    #         data = pickle.load(open(data_path, 'rb'))
-    #         visualize_graph(data[-1], projection=("2d" if in_projection else "3d"), results_path=results_path)
-
-    # if make_plots:
-    #     print("Saved RF and GNN comparison figure")
-    #     plot_comparison_figure(results, results_path=results_path)
 
     
 if __name__ == "__main__":
     aggr = args.aggr
     use_loops = args.loops
+    mode = args.mode
         
-    for r_link in [3, 5, 10, 0.3, 0.5, 1, 2, 2.5, 3.5, 4, 7.5]: 
-        main(r_link=r_link, aggr=aggr, use_loops=use_loops)
+    for D_link in [1, 3, 5, 0.3, 0.5, 1.5, 2, 2.5, 3.5, 4, 5, 7.5, 10]: 
+        main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

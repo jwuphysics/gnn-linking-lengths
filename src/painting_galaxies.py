@@ -7,12 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import SubsetRandomSampler
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader, LinkNeighborLoader, DataLoader, RandomNodeLoader, DynamicBatchSampler
+from torch_geometric.loader import NeighborLoader, DataLoader, RandomNodeLoader, NodeLoader
 from torch_geometric.nn import (
     MessagePassing, GCNConv, PPFConv, MetaLayer, EdgeConv,
     global_mean_pool, global_max_pool, global_add_pool
 )
-from torch_geometric.transforms import IndexToMask
+from torch_geometric.utils import index_to_mask
+# from torch_geometric.transforms import IndexToMask
 from torch_cluster import radius_graph
 
 import numpy as np
@@ -24,7 +25,7 @@ import illustris_python as il
 
 from tqdm import tqdm
 from easyquery import Query
-
+import gc
 import argparse
 import random
 
@@ -50,7 +51,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
 recompile_data = False
-retrain = True
+retrain = False
 revalidate = True
 make_plots = True
 save_models = True
@@ -220,6 +221,9 @@ def prepare_subhalos(dmo_link_method="sublink"):
 
 def make_cosmic_graph(subhalos):
     df = subhalos.copy()
+
+    subhalo_id = torch.tensor(df.index.values, dtype=torch.long)
+
     df.reset_index(drop=True)
 
     # DMO only properties
@@ -240,6 +244,9 @@ def make_cosmic_graph(subhalos):
 
     is_central = torch.tensor(df[['is_central']].values, dtype=torch.int)
     halfmassradius = torch.tensor(df[['subhalo_logstellarhalfmassradius']].values, dtype=torch.float)
+
+    # cw params
+    cw_params = torch.tensor(df[["d_minima", "d_node", "d_saddle_1", "d_saddle_2", "d_skel"]].values, dtype=torch.float)
 
     # make links
     kd_tree = scipy.spatial.KDTree(pos, leafsize=25, boxsize=boxsize)
@@ -287,13 +294,13 @@ def make_cosmic_graph(subhalos):
     cos2 = np.array([np.dot(unitrow[i,:].T,unitdiff[i,:]) for i in range(num_pairs)])
 
     # same invariant edge features but for velocity
-    vel = np.vstack(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].to_numpy())
-    vel_diff = vel[row]-vel[col]
+    velnorm = np.vstack(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].to_numpy())
+    vel_diff = velnorm[row]-velnorm[col]
     vel_norm = np.linalg.norm(vel_diff, axis=1)
-    vel_centroid = np.array(vel.mean(0))
+    vel_centroid = np.array(velnorm.mean(0))
 
-    vel_unitrow = (vel[row]-vel_centroid)/np.linalg.norm(vel[row]-vel_centroid, axis=1).reshape(-1, 1)
-    vel_unitcol = (vel[col]-vel_centroid)/np.linalg.norm(vel[col]-vel_centroid, axis=1).reshape(-1, 1)
+    vel_unitrow = (velnorm[row]-vel_centroid)/np.linalg.norm(velnorm[row]-vel_centroid, axis=1).reshape(-1, 1)
+    vel_unitcol = (velnorm[col]-vel_centroid)/np.linalg.norm(velnorm[col]-vel_centroid, axis=1).reshape(-1, 1)
     vel_unitdiff = vel_diff / vel_norm.reshape(-1,1)
     vel_cos1 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitcol[i,:]) for i in range(num_pairs)])
     vel_cos2 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitdiff[i,:]) for i in range(num_pairs)])
@@ -322,7 +329,9 @@ def make_cosmic_graph(subhalos):
         x_hydro=x_hydro,
         pos_hydro=pos_hydro,
         vel_hydro=vel_hydro,
-        halfmassradius=halfmassradius
+        halfmassradius=halfmassradius,
+        subhalo_id=subhalo_id,
+        cw_params=cw_params
     )
 
     return data
@@ -495,9 +504,38 @@ class EdgeInteractionGNN(nn.Module):
         x = torch.concat([self.fc(h), data.x], axis=1) # latent channels + data.x
                 
         return (self.galaxy_halo_mlp(x))
-
-
                     
+class SequentialNodeLoader(torch.utils.data.DataLoader):
+    r"""A data loader that sequentially samples nodes within a graph and returns
+    their induced subgraph. Based on the RandomNodeLoader 
+    """
+    def __init__(
+        self,
+        data: Data,
+        num_parts: int,
+        **kwargs,
+    ):
+        self.data = data
+        self.num_parts = num_parts
+
+        self.edge_index = data.edge_index
+        self.num_nodes = data.num_nodes
+
+        super().__init__(
+            range(self.num_nodes),
+            batch_size=math.ceil(self.num_nodes / num_parts),
+            collate_fn=self.collate_fn,
+            **kwargs,
+        )
+
+    def collate_fn(self, index):
+        if not isinstance(index, Tensor):
+            index = torch.tensor(index)
+
+        if isinstance(self.data, Data):
+            return self.data.subgraph(index)
+            
+
 def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e-10):
     """k must be between `range(0, K)`. 
 
@@ -578,6 +616,7 @@ def validate(dataloader, model, device):
     y_trues = []
     logvar_preds = []
 
+
     for data in (dataloader):
         with torch.no_grad():
             data.to(device)
@@ -597,6 +636,7 @@ def validate(dataloader, model, device):
             y_trues += list(data.y.detach().cpu().numpy())
             logvar_preds += list(logvar_pred.detach().cpu().numpy())
 
+
     y_preds = np.concatenate(y_preds)
     y_trues = np.array(y_trues)
     logvar_preds = np.concatenate(logvar_preds)
@@ -607,7 +647,7 @@ def validate(dataloader, model, device):
         np.mean(uncertainties, -1),
         y_preds,
         y_trues,
-        logvar_preds
+        logvar_preds,
     )
     
 
@@ -732,7 +772,6 @@ def main(
     Path(f"{results_path}/models").mkdir(parents=True, exist_ok=True)
     
     if not os.path.isfile(f"{results_path}/cross-validation.csv") or recompile_data or retrain or revalidate:
-        import gc; gc.collect()
 
         # get DMO & hydro linked catalogs with all cuts
         catalog_path = f"{results_path}/data/subhalos_DMO-matched.parquet"
@@ -763,107 +802,157 @@ def main(
         else:
             data.x = torch.cat((data.x, data.is_central.type(torch.float)), dim=-1)
 
-        # training
-        node_features = data.x.shape[1]
-        edge_features = data.edge_attr.shape[1]
-        out_features = data.y.shape[1]
+        if retrain or revalidate:
+            # training
+            node_features = data.x.shape[1]
+            edge_features = data.edge_attr.shape[1]
+            out_features = data.y.shape[1]
 
-        lr = training_params["learning_rate"]
-        wd = training_params["weight_decay"]
-        betas_adam = training_params["betas_adam"]
-        batch_size = training_params["batch_size"]
-        n_epochs = training_params["n_epochs"]
+            lr = training_params["learning_rate"]
+            wd = training_params["weight_decay"]
+            betas_adam = training_params["betas_adam"]
+            batch_size = training_params["batch_size"]
+            n_epochs = training_params["n_epochs"]
 
-        model = EdgeInteractionGNN(
-            node_features=node_features,
-            edge_features=edge_features, 
-            n_layers=n_layers, 
-            D_link=D_link,
-            hidden_channels=n_hidden,
-            latent_channels=n_latent,
-            loop=use_loops,
-            n_unshared_layers=n_unshared_layers,
-            n_out=out_features,
-            aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
-        )
-        model.to(device)
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            lr=lr, 
-            weight_decay=wd,
-            betas=betas_adam,
-        )
+            for k in range(K):
+                model = EdgeInteractionGNN(
+                    node_features=node_features,  # note that there are 3 features counting `is_central`, but this final feature is not in `data.x`
+                    edge_features=edge_features, 
+                    n_layers=n_layers, 
+                    D_link=D_link,
+                    hidden_channels=n_hidden,
+                    latent_channels=n_latent,
+                    loop=use_loops,
+                    n_unshared_layers=n_unshared_layers,
+                    n_out=out_features,
+                    aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
+                )
+                model.to(device)
 
-        for k in range(K):
-            train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
+                optimizer = torch.optim.AdamW(
+                    model.parameters(), 
+                    lr=lr, 
+                    weight_decay=wd,
+                    betas=betas_adam,
+                )
+                
+                train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
 
-            train_sampler = SubsetRandomSampler(train_indices)
-            valid_sampler = SubsetRandomSampler(valid_indices)
+                valid_loader = RandomNodeLoader(
+                    data.subgraph(valid_indices),
+                    num_parts=np.ceil(len(valid_indices) / batch_size),
+                    shuffle=False
+                )
 
-            
-            valid_loader = RandomNodeLoader(
-                data,
-                num_parts=(len(valid_indices) // batch_size),
-                sampler=valid_sampler
-            )
+                gc.collect()
 
-            # training log
-            train_losses = []
-            valid_losses = []
-            with open(f'{results_path}/logs/training-{mode}.log', 'a') as f:
-                for epoch in range(n_epochs):
+                model_path = f"{results_path}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt"
+                valid_results_path = f"{results_path}/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.cat"
 
-                    train_loader = RandomNodeLoader(
-                        data,
-                        num_parts=len(train_indices) // batch_size,
-                        sampler=train_sampler
+                if retrain or not os.path.isfile(model_path):
+                    # training log
+                    train_losses = []
+                    valid_losses = []
+                    with open(f'{results_path}/logs/training-{mode}-fold_{k+1}.log', 'a') as f:
+                        for epoch in range(n_epochs):
+
+                            train_loader = RandomNodeLoader(
+                                data.subgraph(train_indices),
+                                num_parts=np.ceil(len(train_indices) / batch_size),
+                                shuffle=True
+                            )
+
+                            if epoch == int(n_epochs * 0.5):
+                                optimizer = torch.optim.AdamW(
+                                    model.parameters(), 
+                                    lr=lr / 5, 
+                                    weight_decay=wd,
+                                    betas=betas_adam,
+                                )
+                            elif epoch == (n_epochs * 0.75):
+                                optimizer = torch.optim.AdamW(
+                                    model.parameters(), 
+                                    lr=lr / 25, 
+                                    weight_decay=wd,
+                                    betas=betas_adam,
+                                )
+
+                            train_loss = train(train_loader, model, optimizer, device)
+                            valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
+
+                            train_losses.append(train_loss)
+                            valid_losses.append(valid_loss)
+
+                            f.write(f" {epoch + 1: >4d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}  {np.mean(valid_std): >10.6f}\n")
+                            f.flush()
+
+                    torch.save(model.state_dict(), model_path)
+
+                if revalidate or not os.path.isfile(valid_results_path):
+                    # load previously trained model
+                    model.load_state_dict(torch.load(model_path))
+                    model.to(device);
+
+                    valid_loader = RandomNodeLoader(
+                        data.subgraph(valid_indices),
+                        num_parts=np.ceil(len(valid_indices) / batch_size),
+                        shuffle=False
                     )
 
-                    if epoch == int(n_epochs * 0.5):
-                        optimizer = torch.optim.AdamW(
-                            model.parameters(), 
-                            lr=lr / 5, 
-                            weight_decay=wd,
-                            betas=betas_adam,
-                        )
-                    elif epoch == (n_epochs * 0.75):
-                        optimizer = torch.optim.AdamW(
-                            model.parameters(), 
-                            lr=lr / 25, 
-                            weight_decay=wd,
-                            betas=betas_adam,
-                        )
-
-                    train_loss = train(train_loader, model, optimizer, device)
                     valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
+                    assert len(data.y[valid_indices]) == len(p)
 
-                    train_losses.append(train_loss)
-                    valid_losses.append(valid_loss)
+                    # helper function to select the validation indices for 1-d tensors in `data`
+                    # and return as numpy
+                    select_valid = lambda data_tensor: data_tensor[valid_indices].numpy().flatten()
+                    results = pd.DataFrame({
+                        "subhalo_id": select_valid(data.subhalo_id),
+                        "log_Mstar": select_valid(data.y),
+                        f"p_GNN_{mode}": p,
+                        "log_Mhalo_dmo": select_valid(data.x[:, 0]),
+                        "log_Vmax_dmo": select_valid(data.x[:, 1]),
+                        "x_dmo": select_valid(data.pos[:, 0]),
+                        "y_dmo": select_valid(data.pos[:, 1]),
+                        "z_dmo": select_valid(data.pos[:, 2]),
+                        "vx_dmo": select_valid(data.vel[:, 0]),
+                        "vy_dmo": select_valid(data.vel[:, 1]),
+                        "vz_dmo": select_valid(data.vel[:, 2]),
+                        "is_central": select_valid(data.is_central).astype(int),
+                        "log_Mhalo_hydro": select_valid(data.x_hydro[:, 0]),
+                        "log_Vmax_hydro": select_valid(data.x_hydro[:, 1]),
+                        "x_hydro": select_valid(data.pos_hydro[:, 0]),
+                        "y_hydro": select_valid(data.pos_hydro[:, 1]),
+                        "z_hydro": select_valid(data.pos_hydro[:, 2]),
+                        "vx_hydro": select_valid(data.vel_hydro[:, 0]),
+                        "vy_hydro": select_valid(data.vel_hydro[:, 1]),
+                        "vz_hydro": select_valid(data.vel_hydro[:, 2]),
+                        "Rstar_50": select_valid(data.halfmassradius),
+                        "d_minima": select_valid(data.cw_params[:, 0]),
+                        "d_node": select_valid(data.cw_params[:, 1]),
+                        "d_saddle_1": select_valid(data.cw_params[:, 2]),
+                        "d_saddle_2": select_valid(data.cw_params[:, 3]),
+                        "d_skel": select_valid(data.cw_params[:, 4]),
+                    })
 
-                    f.write(f" {epoch + 1: >4d}    {train_loss: >7.3f}    {valid_loss: >7.3f}    {np.sqrt(np.mean((p - y.flatten())**2)): >7.4f}  {np.mean(valid_std): >7.4f}\n")
-                    f.flush()
+                    assert torch.allclose(torch.tensor(y), data.y[valid_indices])
 
-            torch.save(model.state_dict(), f"{ROOT}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt")
+                    results.to_csv(valid_results_path, index=False)
 
-    #     # keep track of which are centrals/sats
-    #     is_central = np.concatenate([d.is_central for d in data])
-
-    #     # combine results together and write outputs
-    #     results = combine_results(split=split, centrals=is_central, results_path=results_path)
-    # else:
-    #     print("Loading previous results (if you want to refresh the results, set retrain=True and/or revalidate=True)")
-    #     results = pd.read_csv(f"{results_path}/cross-validation.csv")
     
-    # print("Saved out metrics in LaTeX table format")
-    # save_metrics(results, results_path=results_path)
     
-
+### TODO (8/22)
+### 1. I just added the cosmic web and subhalo_id entries to the method that creates 
+###    `data` objects, but we still need to recreate all of the graphs.
+### 2. We also need to check that the new NodeLoader with SequentialSampler works and
+###    gives expected results. 
+### 3. Finally, we need to generate the validation catalogs, combine the 3-fold validation
+###    and then see how predicted Mstar and groun truth (for both DMO and hydro).
     
 if __name__ == "__main__":
     aggr = args.aggr
     use_loops = args.loops
     mode = args.mode
         
-    for D_link in [1, 3, 5, 0.3, 0.5, 1.5, 2, 2.5, 3.5, 4, 5, 7.5, 10]: 
+    for D_link in [0.3, 1, 3, 5, 10, 0.5, 1.5, 2, 2.5, 3.5, 4, 7.5,]: 
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

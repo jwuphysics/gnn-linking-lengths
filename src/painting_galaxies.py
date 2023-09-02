@@ -38,7 +38,6 @@ args = parser.parse_args()
 
 ROOT = Path(__file__).parent.parent.resolve()
 tng_base_path = f"{ROOT}/illustris_data/TNG300-1/output"
-results_path = f"{ROOT}/results/painting-galaxies"
 
 seed = 255
 rng = np.random.RandomState(seed)
@@ -50,7 +49,7 @@ c0, c1, c2, c3, c4 = '#003f5c', '#58508d', '#bc5090', '#ff6361', '#ffa600'
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
-recompile_data = False
+recompile_data = True
 retrain = False
 revalidate = True
 make_plots = True
@@ -318,6 +317,11 @@ def make_cosmic_graph(subhalos):
         edge_attr = np.append(edge_attr, atrloops, 0)
     edge_index = edge_index.astype(int)
 
+    overdensity = torch.zeros(len(x), dtype=x.dtype)
+    for i in range(len(x)):
+        neighbors = edge_index[1, edge_index[0] == i] # get neighbor indices
+        overdensity[i] = torch.log10((10**x[neighbors, -2]).sum()) # get sum of masses of neighbors (2nd to last index in `x`)
+
     data = Data(
         x=x,
         edge_index=torch.tensor(edge_index, dtype=torch.long),
@@ -331,6 +335,7 @@ def make_cosmic_graph(subhalos):
         vel_hydro=vel_hydro,
         halfmassradius=halfmassradius,
         subhalo_id=subhalo_id,
+        overdensity=overdensity,
         cw_params=cw_params
     )
 
@@ -928,6 +933,7 @@ def main(
                         "vy_hydro": select_valid(data.vel_hydro[:, 1]),
                         "vz_hydro": select_valid(data.vel_hydro[:, 2]),
                         "Rstar_50": select_valid(data.halfmassradius),
+                        "overdensity": select_valid(data.overdensity),
                         "d_minima": select_valid(data.cw_params[:, 0]),
                         "d_node": select_valid(data.cw_params[:, 1]),
                         "d_saddle_1": select_valid(data.cw_params[:, 2]),
@@ -939,16 +945,6 @@ def main(
 
                     results.to_csv(valid_results_path, index=False)
 
-    
-    
-### TODO (8/22)
-### 1. I just added the cosmic web and subhalo_id entries to the method that creates 
-###    `data` objects, but we still need to recreate all of the graphs.
-### 2. We also need to check that the new NodeLoader with SequentialSampler works and
-###    gives expected results. 
-### 3. Finally, we need to generate the validation catalogs, combine the 3-fold validation
-###    and then see how predicted Mstar and groun truth (for both DMO and hydro).
-    
 if __name__ == "__main__":
     aggr = args.aggr
     use_loops = args.loops

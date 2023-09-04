@@ -49,9 +49,10 @@ c0, c1, c2, c3, c4 = '#003f5c', '#58508d', '#bc5090', '#ff6361', '#ffa600'
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
-recompile_data = True
+recompile_data = False
 retrain = False
-revalidate = True
+revalidate = False
+collate_results = True
 make_plots = True
 save_models = True
 
@@ -775,8 +776,10 @@ def main(
     Path(f"{results_path}/data").mkdir(parents=True, exist_ok=True)
     Path(f"{results_path}/logs").mkdir(parents=True, exist_ok=True)
     Path(f"{results_path}/models").mkdir(parents=True, exist_ok=True)
+
     
-    if not os.path.isfile(f"{results_path}/cross-validation.csv") or recompile_data or retrain or revalidate:
+    
+    if recompile_data or retrain or revalidate:
 
         # get DMO & hydro linked catalogs with all cuts
         catalog_path = f"{results_path}/data/subhalos_DMO-matched.parquet"
@@ -944,6 +947,8 @@ def main(
                     assert torch.allclose(torch.tensor(y), data.y[valid_indices])
 
                     results.to_csv(valid_results_path, index=False)
+
+
 
 if __name__ == "__main__":
     aggr = args.aggr

@@ -12,7 +12,7 @@ from torch_geometric.nn import (
     MessagePassing, GCNConv, PPFConv, MetaLayer, EdgeConv,
     global_mean_pool, global_max_pool, global_add_pool
 )
-from torch_geometric.utils import index_to_mask
+from torch_geometric.utils import index_to_mask, to_undirected
 # from torch_geometric.transforms import IndexToMask
 from torch_cluster import radius_graph
 
@@ -50,16 +50,16 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
 recompile_data = False
-retrain = False
-revalidate = False
+retrain = True
+revalidate = True
 collate_results = True
 make_plots = True
 save_models = True
 
 cuts = {
-    "minimum_log_stellar_mass": 9,
-    "minimum_log_halo_mass": 11,
-    "minimum_n_star_particles": 50
+    "minimum_log_stellar_mass": 7.5,
+    "minimum_log_halo_mass": 10.5,
+    "minimum_n_star_particles": 20
 }
 
 # these are global because I'm lazy
@@ -165,7 +165,7 @@ def load_subhalos(hydro=True, normalization_params=normalization_params, cuts=cu
     subhalos["subhalo_logstellarhalfmassradius"] = np.log10(subhalos["subhalo_stellarhalfmassradius"])
         
     if hydro:
-        # DM cuts
+        # DM cuts -- do not put outside `if` statement, otherwise indices will be missing during the `prepare_subhalos()` call
         subhalos.drop("subhalo_flag", axis=1, inplace=True)
         subhalos = subhalos[subhalos["subhalo_loghalomass"] > cuts["minimum_log_halo_mass"]].copy()
         # stellar mass and particle cuts
@@ -175,7 +175,7 @@ def load_subhalos(hydro=True, normalization_params=normalization_params, cuts=cu
     
     return subhalos
 
-def prepare_subhalos(dmo_link_method="sublink"):
+def prepare_subhalos(dmo_link_method="sublink", cuts=cuts):
     """Helper function to load subhalos, join to DMO simulation, add cosmic web
     parameters, and impose cuts.
 
@@ -184,7 +184,6 @@ def prepare_subhalos(dmo_link_method="sublink"):
     
     subhalos = load_subhalos()
     subhalos_dmo = load_subhalos(hydro=False)
-
 
     valid_idxs_l_halo_tree = subhalos_dmo.index.isin(subhalos.subhalo_l_halo_tree)
     subhalos_linked = pd.concat(
@@ -219,7 +218,7 @@ def prepare_subhalos(dmo_link_method="sublink"):
 
     return subhalos_linked
 
-def make_cosmic_graph(subhalos):
+def make_cosmic_graph(subhalos, D_link):
     df = subhalos.copy()
 
     subhalo_id = torch.tensor(df.index.values, dtype=torch.long)
@@ -250,18 +249,13 @@ def make_cosmic_graph(subhalos):
 
     # make links
     kd_tree = scipy.spatial.KDTree(pos, leafsize=25, boxsize=boxsize)
-    edge_index = kd_tree.query_pairs(r=D_link, output_type="ndarray")
+    edge_index = kd_tree.query_pairs(r=D_link, output_type="ndarray").astype(int)
 
     # normalize positions
     df[['subhalo_x', 'subhalo_y', 'subhalo_z']] = df[['subhalo_x', 'subhalo_y', 'subhalo_z']]/(boxsize/2)
 
-    # Add reverse pairs
-    reversepairs = np.zeros((edge_index.shape[0], 2))
-    for i, pair in enumerate(edge_index):
-        reversepairs[i] = np.array([pair[1], pair[0]])
-    edge_index = np.append(edge_index, reversepairs, 0)
-
-    edge_index = edge_index.astype(int)
+    # add reverse pairs
+    edge_index = to_undirected(torch.Tensor(edge_index).t().contiguous().type(torch.long)).numpy()
 
     # Write in pytorch-geometric format
     edge_index = edge_index.reshape((2,-1))
@@ -290,8 +284,8 @@ def make_cosmic_graph(subhalos):
     unitcol = (pos[col]-centroid)/np.linalg.norm((pos[col]-centroid), axis=1).reshape(-1,1)
     unitdiff = diff/dist.reshape(-1,1)
     # Dot products between unit vectors
-    cos1 = np.array([np.dot(unitrow[i,:].T,unitcol[i,:]) for i in range(num_pairs)])
-    cos2 = np.array([np.dot(unitrow[i,:].T,unitdiff[i,:]) for i in range(num_pairs)])
+    cos1 = np.array([np.dot(unitrow[i,:], unitcol[i,:]) for i in range(num_pairs)])
+    cos2 = np.array([np.dot(unitrow[i,:], unitdiff[i,:]) for i in range(num_pairs)])
 
     # same invariant edge features but for velocity
     velnorm = np.vstack(df[['subhalo_vx', 'subhalo_vy', 'subhalo_vz']].to_numpy())
@@ -302,8 +296,8 @@ def make_cosmic_graph(subhalos):
     vel_unitrow = (velnorm[row]-vel_centroid)/np.linalg.norm(velnorm[row]-vel_centroid, axis=1).reshape(-1, 1)
     vel_unitcol = (velnorm[col]-vel_centroid)/np.linalg.norm(velnorm[col]-vel_centroid, axis=1).reshape(-1, 1)
     vel_unitdiff = vel_diff / vel_norm.reshape(-1,1)
-    vel_cos1 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitcol[i,:]) for i in range(num_pairs)])
-    vel_cos2 = np.array([np.dot(vel_unitrow[i,:].T,vel_unitdiff[i,:]) for i in range(num_pairs)])
+    vel_cos1 = np.array([np.dot(vel_unitrow[i,:], vel_unitcol[i,:]) for i in range(num_pairs)])
+    vel_cos2 = np.array([np.dot(vel_unitrow[i,:], vel_unitdiff[i,:]) for i in range(num_pairs)])
 
     # build edge features
     edge_attr = np.concatenate([dist.reshape(-1,1), cos1.reshape(-1,1), cos2.reshape(-1,1), vel_norm.reshape(-1,1), vel_cos1.reshape(-1,1), vel_cos2.reshape(-1,1)], axis=1)
@@ -318,6 +312,7 @@ def make_cosmic_graph(subhalos):
         edge_attr = np.append(edge_attr, atrloops, 0)
     edge_index = edge_index.astype(int)
 
+    # super slow, probably can be optimized...
     overdensity = torch.zeros(len(x), dtype=x.dtype)
     for i in range(len(x)):
         neighbors = edge_index[1, edge_index[0] == i] # get neighbor indices
@@ -431,7 +426,7 @@ class EdgeInteractionLayer(MessagePassing):
 
     def message(self, x_i, x_j, edge_attr):
 
-        self.input = torch.cat([x_i, x_j, edge_attr[0]], dim=-1)
+        self.input = torch.cat([x_i, x_j, edge_attr], dim=-1)
         self.messages = self.mlp(self.input)
 
         return self.messages
@@ -456,7 +451,7 @@ class EdgeInteractionGNN(nn.Module):
         for _ in range(n_layers-1):
             layers += [
                 nn.ModuleList([
-                    EdgeInteractionLayer(3 * latent_channels * n_unshared_layers, hidden_channels, latent_channels, aggr=aggr) 
+                    EdgeInteractionLayer(2 * latent_channels * n_unshared_layers + node_features, hidden_channels, latent_channels, aggr=aggr) 
                     for _ in range(n_unshared_layers)
                 ])
             ]
@@ -465,7 +460,7 @@ class EdgeInteractionGNN(nn.Module):
         
         n_pool = (len(aggr) if isinstance(aggr, list) else 1) 
         self.fc = nn.Sequential(
-            nn.Linear((n_unshared_layers * n_pool )* latent_channels, latent_channels, bias=True),
+            nn.Linear(n_unshared_layers * n_pool * latent_channels, latent_channels, bias=True),
             nn.LayerNorm(latent_channels),
             nn.SiLU(),
             nn.Linear(latent_channels, latent_channels, bias=True),
@@ -492,8 +487,8 @@ class EdgeInteractionGNN(nn.Module):
     def forward(self, data):
         
         # determine edges by getting neighbors within radius defined by `D_link`
-        edge_index = radius_graph(data.pos, r=self.D_link, batch=data.batch, loop=self.loop)
-        edge_attr = data.edge_attr[edge_index]
+        edge_index = data.edge_index
+        edge_attr = data.edge_attr
 
         # update hidden state on edge (h, or sometimes e_ij in the text)
         h = torch.cat([unshared_layer(data.x, edge_index=edge_index, edge_attr=edge_attr) for unshared_layer in self.layers[0]], axis=1)
@@ -511,36 +506,7 @@ class EdgeInteractionGNN(nn.Module):
                 
         return (self.galaxy_halo_mlp(x))
                     
-class SequentialNodeLoader(torch.utils.data.DataLoader):
-    r"""A data loader that sequentially samples nodes within a graph and returns
-    their induced subgraph. Based on the RandomNodeLoader 
-    """
-    def __init__(
-        self,
-        data: Data,
-        num_parts: int,
-        **kwargs,
-    ):
-        self.data = data
-        self.num_parts = num_parts
-
-        self.edge_index = data.edge_index
-        self.num_nodes = data.num_nodes
-
-        super().__init__(
-            range(self.num_nodes),
-            batch_size=math.ceil(self.num_nodes / num_parts),
-            collate_fn=self.collate_fn,
-            **kwargs,
-        )
-
-    def collate_fn(self, index):
-        if not isinstance(index, Tensor):
-            index = torch.tensor(index)
-
-        if isinstance(self.data, Data):
-            return self.data.subgraph(index)
-            
+           
 
 def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e-10):
     """k must be between `range(0, K)`. 
@@ -777,12 +743,12 @@ def main(
     Path(f"{results_path}/logs").mkdir(parents=True, exist_ok=True)
     Path(f"{results_path}/models").mkdir(parents=True, exist_ok=True)
 
-    
-    
-    if recompile_data or retrain or revalidate:
+    catalog_path = f"{results_path}/data/subhalos_DMO-matched.parquet"
+    data_path = f"{results_path}/data/cosmic_graphs.pkl"
+    if recompile_data or retrain or revalidate or not os.path.isfile(data_path):
 
         # get DMO & hydro linked catalogs with all cuts
-        catalog_path = f"{results_path}/data/subhalos_DMO-matched.parquet"
+        
         if os.path.isfile(catalog_path) and not recompile_data:
             subhalos = pd.read_parquet(catalog_path)
         else:
@@ -790,12 +756,12 @@ def main(
             subhalos.to_parquet(catalog_path)
 
         # make cosmic graphs
-        data_path = f"{results_path}/data/cosmic_graphs.pkl"
+        
         if os.path.isfile(data_path) and not recompile_data:
             with open(data_path, "rb") as data_file:
                 data = pickle.load(data_file)
         else:
-            data = make_cosmic_graph(subhalos)
+            data = make_cosmic_graph(subhalos, D_link=D_link)
             with open(data_path, "wb") as data_file:
                 pickle.dump(data, data_file)
 
@@ -850,7 +816,8 @@ def main(
                 valid_loader = RandomNodeLoader(
                     data.subgraph(valid_indices),
                     num_parts=np.ceil(len(valid_indices) / batch_size),
-                    shuffle=False
+                    shuffle=False,
+                    pin_memory=True,
                 )
 
                 gc.collect()
@@ -863,13 +830,14 @@ def main(
                     train_losses = []
                     valid_losses = []
                     with open(f'{results_path}/logs/training-{mode}-fold_{k+1}.log', 'a') as f:
-                        for epoch in range(n_epochs):
+                        train_loader = RandomNodeLoader(
+                            data.subgraph(train_indices),
+                            num_parts=np.ceil(len(train_indices) / batch_size),
+                            shuffle=True,
+                            pin_memory=True
+                        )
 
-                            train_loader = RandomNodeLoader(
-                                data.subgraph(train_indices),
-                                num_parts=np.ceil(len(train_indices) / batch_size),
-                                shuffle=True
-                            )
+                        for epoch in range(n_epochs):
 
                             if epoch == int(n_epochs * 0.5):
                                 optimizer = torch.optim.AdamW(
@@ -905,7 +873,8 @@ def main(
                     valid_loader = RandomNodeLoader(
                         data.subgraph(valid_indices),
                         num_parts=np.ceil(len(valid_indices) / batch_size),
-                        shuffle=False
+                        shuffle=False,
+                        pin_memory=True
                     )
 
                     valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
@@ -955,5 +924,5 @@ if __name__ == "__main__":
     use_loops = args.loops
     mode = args.mode
         
-    for D_link in [0.3, 1, 3, 5, 10, 0.5, 1.5, 2, 2.5, 3.5, 4, 7.5,]: 
+    for D_link in [0.3, 1, 3, 10]: 
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

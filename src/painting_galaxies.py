@@ -12,7 +12,7 @@ from torch_geometric.nn import (
     MessagePassing, GCNConv, PPFConv, MetaLayer, EdgeConv,
     global_mean_pool, global_max_pool, global_add_pool
 )
-from torch_geometric.utils import index_to_mask, to_undirected
+from torch_geometric.utils import index_to_mask, to_undirected, remove_self_loops
 # from torch_geometric.transforms import IndexToMask
 from torch_cluster import radius_graph
 
@@ -52,42 +52,39 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 recompile_data = False
 retrain = True
 revalidate = True
-collate_results = True
 make_plots = True
 save_models = True
 
 cuts = {
     "minimum_log_stellar_mass": 7.5,
-    "minimum_log_halo_mass": 10.5,
-    "minimum_n_star_particles": 20
+    "minimum_log_halo_mass": 11,
+    "minimum_n_star_particles": 50
 }
 
-# these are global because I'm lazy
 boxsize = (205 / 0.6774)    # box size in comoving kpc/h
 h = 0.6774                  # reduced Hubble constant
 snapshot = 99,              # z = 0
-
 
 normalization_params = dict(
     norm_half_mass_radius=8., 
     norm_velocity=100.
 )
 
-### training and optimization params
+# training and optimization params
 training_params = dict(
-    batch_size=8192,
+    min_batch_size=1000,
+    batch_size=30000,
     n_epochs=1000,
     learning_rate=1e-2,
-    weight_decay=1e-5,
-    betas_adam = (0.9, 0.95),
-    augment=True,
+    weight_decay=1e-3,
+    augment=True
 )
 
 model_params = dict(
     n_layers=1,
-    n_hidden=16,
+    n_hidden=64,
     n_latent=16,
-    n_unshared_layers=16,
+    n_unshared_layers=4,
 )
 
 # GNN params
@@ -312,7 +309,7 @@ def make_cosmic_graph(subhalos, D_link):
         edge_attr = np.append(edge_attr, atrloops, 0)
     edge_index = edge_index.astype(int)
 
-    # super slow, probably can be optimized...
+    # super slow, probably can be optimized or perhaps parallelized...
     overdensity = torch.zeros(len(x), dtype=x.dtype)
     for i in range(len(x)):
         neighbors = edge_index[1, edge_index[0] == i] # get neighbor indices
@@ -405,16 +402,16 @@ def visualize_graph(data, draw_edges=True, projection="3d", edge_index=None, box
 class EdgeInteractionLayer(MessagePassing):
     """Interaction network layer with node + edge layers.
     """
-    def __init__(self, n_in, n_hidden, n_latent, aggr='sum'):
+    def __init__(self, n_in, n_hidden, n_latent, aggr='sum', act_fn=nn.SiLU):
         super(EdgeInteractionLayer, self).__init__(aggr)
 
         self.mlp = nn.Sequential(
             nn.Linear(n_in, n_hidden, bias=True),
             nn.LayerNorm(n_hidden),
-            nn.SiLU(),
-            nn.Linear(n_hidden, n_hidden, bias=True),
-            nn.LayerNorm(n_hidden),
-            nn.SiLU(),
+            act_fn(),
+            # nn.Linear(n_hidden, n_hidden, bias=True),
+            # nn.LayerNorm(n_hidden),
+            # act_fn(),
             nn.Linear(n_hidden, n_latent, bias=True),
         )
 
@@ -435,48 +432,48 @@ class EdgeInteractionGNN(nn.Module):
     """Graph net over nodes and edges with multiple unshared layers, and sequential layers with residual connections.
     Self-loops also get their own MLP (i.e. galaxy-halo connection).
     """
-    def __init__(self, n_layers, D_link, node_features=2, edge_features=6, hidden_channels=64, aggr="sum", latent_channels=64, n_out=2, n_unshared_layers=4, loop=True, use_global_pooling=True):
+    def __init__(self, n_layers, D_link, node_features=2, edge_features=6, hidden_channels=64, aggr="sum", latent_channels=64, n_out=1, n_unshared_layers=4, loop=True, act_fn=nn.SiLU):
         super(EdgeInteractionGNN, self).__init__()
 
         self.n_in = 2 * node_features + edge_features 
         self.n_out = n_out
-        self.use_global_pooling = use_global_pooling
+        self.n_pool = (len(aggr) if isinstance(aggr, list) else 1) 
         
         layers = [
             nn.ModuleList([
-                EdgeInteractionLayer(self.n_in, hidden_channels, latent_channels, aggr=aggr)
+                EdgeInteractionLayer(self.n_in, hidden_channels, latent_channels, aggr=aggr, act_fn=act_fn)
                 for _ in range(n_unshared_layers)
             ])
         ]
         for _ in range(n_layers-1):
             layers += [
                 nn.ModuleList([
-                    EdgeInteractionLayer(2 * latent_channels * n_unshared_layers + node_features, hidden_channels, latent_channels, aggr=aggr) 
+                    # EdgeInteractionLayer(2 * latent_channels * n_unshared_layers + node_features, hidden_channels, latent_channels, aggr=aggr, act_fn=act_fn) 
+                    EdgeInteractionLayer(self.n_pool * (2 * latent_channels * n_unshared_layers + node_features), hidden_channels, latent_channels, aggr=aggr, act_fn=act_fn) 
                     for _ in range(n_unshared_layers)
                 ])
             ]
    
         self.layers = nn.ModuleList(layers)
         
-        n_pool = (len(aggr) if isinstance(aggr, list) else 1) 
-        self.fc = nn.Sequential(
-            nn.Linear(n_unshared_layers * n_pool * latent_channels, latent_channels, bias=True),
-            nn.LayerNorm(latent_channels),
-            nn.SiLU(),
-            nn.Linear(latent_channels, latent_channels, bias=True),
-            nn.LayerNorm(latent_channels),
-            nn.SiLU(),
-            nn.Linear(latent_channels, latent_channels, bias=True)
+        self.galaxy_environment_mlp = nn.Sequential(
+            nn.Linear(self.n_pool * n_unshared_layers * latent_channels, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            # nn.Linear(hidden_channels, hidden_channels, bias=True),
+            # nn.LayerNorm(hidden_channels),
+            # act_fn(),
+            nn.Linear(hidden_channels, n_out, bias=True)
         )
-        
+
         self.galaxy_halo_mlp = nn.Sequential(
-            nn.Linear(latent_channels + node_features, latent_channels, bias=True),
-            nn.LayerNorm(latent_channels),
-            nn.SiLU(),
-            nn.Linear(latent_channels, latent_channels, bias=True),
-            nn.LayerNorm(latent_channels),
-            nn.SiLU(),
-            nn.Linear(latent_channels, 2 * n_out, bias=True)
+            nn.Linear(node_features, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            # nn.Linear(hidden_channels, hidden_channels, bias=True),
+            # nn.LayerNorm(hidden_channels),
+            # act_fn(),
+            nn.Linear(hidden_channels, n_out, bias=True)
         )
         
         self.D_link = D_link
@@ -497,14 +494,12 @@ class EdgeInteractionGNN(nn.Module):
         
         for layer in self.layers[1:]:
             # if multiple layers deep, also use a residual layer
-            h = self.h + torch.cat([unshared_layer(h, edge_index=edge_index) for unshared_layer in layer], axis=1)
+            h = self.h + torch.cat([unshared_layer(h, edge_index=edge_index, edge_attr=edge_attr) for unshared_layer in layer], axis=1)
         
             self.h = h
             h = h.relu()
-        
-        x = torch.concat([self.fc(h), data.x], axis=1) # latent channels + data.x
-                
-        return (self.galaxy_halo_mlp(x))
+                        
+        return (self.galaxy_environment_mlp(h) + self.galaxy_halo_mlp(data.x))
                     
            
 
@@ -545,15 +540,15 @@ def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e
     return train_indices, valid_indices
 
 
-def train(dataloader, model, optimizer, device, augment=True):
+def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=3.0):
     """Assumes that data object in dataloader has 8 columns: x,y,z, vx,vy,vz, Mh, Vmax"""
     model.train()
 
     loss_total = 0
     for data in (dataloader):
         if augment: # add random noise
-            data_node_features_scatter = 4e-3 * torch.randn_like(data.x) * torch.std(data.x, dim=0)
-            data_edge_features_scatter = 4e-3 * torch.randn_like(data.edge_attr) * torch.std(data.edge_attr, dim=0)
+            data_node_features_scatter = 1e-3 * torch.randn_like(data.x) * torch.std(data.x, dim=0)
+            data_edge_features_scatter = 1e-3 * torch.randn_like(data.edge_attr) * torch.std(data.edge_attr, dim=0)
             
             data.x += data_node_features_scatter
             data.edge_attr += data_edge_features_scatter
@@ -561,17 +556,13 @@ def train(dataloader, model, optimizer, device, augment=True):
         data.to(device)
 
         optimizer.zero_grad()
-        y_pred, logvar_pred = model(data).chunk(2, dim=1)
-        y_pred = y_pred.view(-1, model.n_out)
-        logvar_pred = logvar_pred.view(-1, model.n_out)
-
-        # compute loss as sum of two terms for likelihood-free inference
-        loss_mse = F.mse_loss(y_pred, data.y)
-        loss_lfi = F.mse_loss((y_pred - data.y)**2, 10**logvar_pred)
-
-        loss = torch.log(loss_mse) + torch.log(loss_lfi)
+        y_pred = model(data).view(-1, model.n_out)
+        loss = F.mse_loss(y_pred, data.y)
 
         loss.backward()
+        # use gradient clipping to prevent exploding gradients
+        if max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
         loss_total += loss.item()
 
@@ -581,65 +572,71 @@ def train(dataloader, model, optimizer, device, augment=True):
 def validate(dataloader, model, device):
     model.eval()
 
-    uncertainties = []
     loss_total = 0
 
     y_preds = []
     y_trues = []
-    logvar_preds = []
 
 
     for data in (dataloader):
         with torch.no_grad():
             data.to(device)
-            y_pred, logvar_pred = model(data).chunk(2, dim=1)
-            y_pred = y_pred.view(-1, model.n_out)
-            logvar_pred = logvar_pred.view(-1, model.n_out)
-            uncertainties.append(np.sqrt(10**logvar_pred.detach().cpu().numpy()).mean(-1))
-
-            # compute loss as sum of two terms a la Moment Networks (Jeffrey & Wandelt 2020)
-            loss_mse = F.mse_loss(y_pred, data.y)
-            loss_lfi = F.mse_loss((y_pred - data.y)**2, 10**logvar_pred)
-
-            loss = torch.log(loss_mse) + torch.log(loss_lfi)
+            y_pred = model(data).view(-1, model.n_out)
+            loss = F.mse_loss(y_pred, data.y)
 
             loss_total += loss.item()
             y_preds += list(y_pred.detach().cpu().numpy())
             y_trues += list(data.y.detach().cpu().numpy())
-            logvar_preds += list(logvar_pred.detach().cpu().numpy())
 
 
     y_preds = np.concatenate(y_preds)
     y_trues = np.array(y_trues)
-    logvar_preds = np.concatenate(logvar_preds)
-    uncertainties = np.concatenate(uncertainties)
 
     return (
         loss_total / len(dataloader),
-        np.mean(uncertainties, -1),
         y_preds,
         y_trues,
-        logvar_preds,
     )
-    
 
-def combine_results(split=6, centrals=None, results_path=None):
-    """Combine all results, including 3d and 2d GNN"""
-    results = []
-    for k in range(split):
-        valid_k = pd.read_csv(f"{results_path}/validation-fold{k+1}.csv")
-        # valid_proj_k = pd.read_csv(f"{results_path}/validation-projected-fold{k+1}.csv", usecols=["p_GNN_2d"])
-        
-        # valid_k["p_GNN_2d"] = valid_proj_k
-        results.append(valid_k)
-    
-    results = pd.concat(results, axis=0, ignore_index=True)
-    
-    if centrals is not None:
-        results["is_central"] = centrals
-    results.to_csv(f"{results_path}/cross-validation.csv", index=False)
-    
-    return results
+def configure_optimizer(model, lr, wd,):
+    """Only apply weight decay to weights, but not to other
+    parameters like biases or LayerNorm. Based on minGPT version.
+    """
+
+    decay, no_decay = set(), set()
+    yes_wd_modules = (torch.nn.Linear, )
+    no_wd_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+    for mn, m in model.named_modules():
+        for pn, p in m.named_parameters():
+            fpn = '%s.%s' % (mn, pn) if mn else pn
+            if pn.endswith('bias'):
+                no_decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, yes_wd_modules):
+                decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, no_wd_modules):
+                no_decay.add(fpn)
+
+    # validate that we considered every parameter
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    inter_params = decay & no_decay
+    union_params = decay | no_decay
+    assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+    assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                % (str(param_dict.keys() - union_params), )
+
+    # create the pytorch optimizer object
+    optim_groups = [
+        {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": wd},
+        {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.},
+    ]
+
+    optimizer = torch.optim.AdamW(
+        optim_groups, 
+        lr=lr, 
+    )
+
+    return optimizer
+
 
 
 def get_metrics(p, y):
@@ -775,147 +772,158 @@ def main(
             data = data_hydro
         else:
             data.x = torch.cat((data.x, data.is_central.type(torch.float)), dim=-1)
+    else:
+        subhalos = pd.read_parquet(catalog_path)
+        with open(data_path, "rb") as data_file:
+                data = pickle.load(data_file)
 
-        if retrain or revalidate:
-            # training
-            node_features = data.x.shape[1]
-            edge_features = data.edge_attr.shape[1]
-            out_features = data.y.shape[1]
+    # remove self-loops
+    if not use_loops:
+        data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
 
-            lr = training_params["learning_rate"]
-            wd = training_params["weight_decay"]
-            betas_adam = training_params["betas_adam"]
-            batch_size = training_params["batch_size"]
-            n_epochs = training_params["n_epochs"]
+        # add a bunch of 1/D, 1/D^2 as features as well
+        data.edge_attr = torch.cat(
+            [
+                data.edge_attr, 
+                (data.edge_attr[:, 0]**-1).view(-1, 1), 
+                (data.edge_attr[:, 0]**-2).view(-1, 1),
+                (data.edge_attr[:, 0]**-3).view(-1, 1),
+            ], 
+            axis=1
+        )
+
+    # training
+    node_features = data.x.shape[1]
+    edge_features = data.edge_attr.shape[1]
+    out_features = data.y.shape[1]
+
+    lr = training_params["learning_rate"]
+    wd = training_params["weight_decay"]
+    min_batch_size = training_params["min_batch_size"]
+    batch_size = training_params["batch_size"]
+    n_epochs = training_params["n_epochs"]
 
 
-            for k in range(K):
-                model = EdgeInteractionGNN(
-                    node_features=node_features,  # note that there are 3 features counting `is_central`, but this final feature is not in `data.x`
-                    edge_features=edge_features, 
-                    n_layers=n_layers, 
-                    D_link=D_link,
-                    hidden_channels=n_hidden,
-                    latent_channels=n_latent,
-                    loop=use_loops,
-                    n_unshared_layers=n_unshared_layers,
-                    n_out=out_features,
-                    aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
-                )
-                model.to(device)
+    for k in range(K):
+        model_path = f"{results_path}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt"
+        valid_results_path = f"{results_path}/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.cat"
+        
+        if retrain or revalidate or not os.path.isfile(model_path):
 
-                optimizer = torch.optim.AdamW(
-                    model.parameters(), 
-                    lr=lr, 
-                    weight_decay=wd,
-                    betas=betas_adam,
-                )
-                
-                train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
+            model = EdgeInteractionGNN(
+                node_features=node_features,  # note that there are 3 features counting `is_central`, but this final feature is not in `data.x`
+                edge_features=edge_features, 
+                n_layers=n_layers, 
+                D_link=D_link,
+                hidden_channels=n_hidden,
+                latent_channels=n_latent,
+                loop=use_loops,
+                n_unshared_layers=n_unshared_layers,
+                n_out=out_features,
+                aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
+            )
+            model.to(device)
+
+            optimizer = configure_optimizer(model, lr, wd)
+            
+            train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
+
+            valid_loader = RandomNodeLoader(
+                data.subgraph(valid_indices),
+                num_parts=np.ceil(len(valid_indices) / batch_size),
+                shuffle=False,
+                pin_memory=True,
+            )
+
+            gc.collect()
+
+            
+            if retrain or not os.path.isfile(model_path):
+                # training log
+                train_losses = []
+                valid_losses = []
+                with open(f'{results_path}/logs/training-{mode}-fold_{k+1}.log', 'a') as f:
+
+                    for epoch in range(n_epochs):
+                        # linearly increase batch size
+                        bs = int(np.max([min_batch_size, int(batch_size*(epoch+1)/n_epochs)]))
+                        train_loader = RandomNodeLoader(
+                            data.subgraph(train_indices),
+                            num_parts=np.ceil(len(train_indices) / bs),
+                            shuffle=True,
+                            pin_memory=True
+                        )
+
+                        if epoch == int(n_epochs * 0.25):
+                            optimizer = configure_optimizer(model, lr/4, wd)
+                        elif epoch == (n_epochs * 0.5):
+                            optimizer = configure_optimizer(model, lr/16, wd)
+                        elif epoch == (n_epochs * 0.75):
+                            optimizer = configure_optimizer(model, lr/64, wd)
+
+                        train_loss = train(train_loader, model, optimizer, device)
+                        valid_loss, p, y  = validate(valid_loader, model, device)
+
+                        train_losses.append(train_loss)
+                        valid_losses.append(valid_loss)
+
+
+                        f.write(f" {epoch + 1: >4d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {bs: >5d}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}\n")
+                        f.flush()
+
+                torch.save(model.state_dict(), model_path)
+
+            if revalidate or not os.path.isfile(valid_results_path):
+                # load previously trained model
+                model.load_state_dict(torch.load(model_path))
+                model.to(device);
 
                 valid_loader = RandomNodeLoader(
                     data.subgraph(valid_indices),
                     num_parts=np.ceil(len(valid_indices) / batch_size),
                     shuffle=False,
-                    pin_memory=True,
+                    pin_memory=True
                 )
 
-                gc.collect()
+                valid_loss, p, y  = validate(valid_loader, model, device)
+                assert len(data.y[valid_indices]) == len(p)
 
-                model_path = f"{results_path}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt"
-                valid_results_path = f"{results_path}/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.cat"
+                # helper function to select the validation indices for 1-d tensors in `data`
+                # and return as numpy
+                select_valid = lambda data_tensor: data_tensor[valid_indices].numpy().flatten()
+                results = pd.DataFrame({
+                    "subhalo_id": select_valid(data.subhalo_id),
+                    "log_Mstar": select_valid(data.y),
+                    f"p_GNN_{mode}": p,
+                    "log_Mhalo_dmo": select_valid(data.x[:, 0]),
+                    "log_Vmax_dmo": select_valid(data.x[:, 1]),
+                    "x_dmo": select_valid(data.pos[:, 0]),
+                    "y_dmo": select_valid(data.pos[:, 1]),
+                    "z_dmo": select_valid(data.pos[:, 2]),
+                    "vx_dmo": select_valid(data.vel[:, 0]),
+                    "vy_dmo": select_valid(data.vel[:, 1]),
+                    "vz_dmo": select_valid(data.vel[:, 2]),
+                    "is_central": select_valid(data.is_central).astype(int),
+                    "log_Mhalo_hydro": select_valid(data.x_hydro[:, 0]),
+                    "log_Vmax_hydro": select_valid(data.x_hydro[:, 1]),
+                    "x_hydro": select_valid(data.pos_hydro[:, 0]),
+                    "y_hydro": select_valid(data.pos_hydro[:, 1]),
+                    "z_hydro": select_valid(data.pos_hydro[:, 2]),
+                    "vx_hydro": select_valid(data.vel_hydro[:, 0]),
+                    "vy_hydro": select_valid(data.vel_hydro[:, 1]),
+                    "vz_hydro": select_valid(data.vel_hydro[:, 2]),
+                    "Rstar_50": select_valid(data.halfmassradius),
+                    "overdensity": select_valid(data.overdensity),
+                    "d_minima": select_valid(data.cw_params[:, 0]),
+                    "d_node": select_valid(data.cw_params[:, 1]),
+                    "d_saddle_1": select_valid(data.cw_params[:, 2]),
+                    "d_saddle_2": select_valid(data.cw_params[:, 3]),
+                    "d_skel": select_valid(data.cw_params[:, 4]),
+                })
 
-                if retrain or not os.path.isfile(model_path):
-                    # training log
-                    train_losses = []
-                    valid_losses = []
-                    with open(f'{results_path}/logs/training-{mode}-fold_{k+1}.log', 'a') as f:
-                        train_loader = RandomNodeLoader(
-                            data.subgraph(train_indices),
-                            num_parts=np.ceil(len(train_indices) / batch_size),
-                            shuffle=True,
-                            pin_memory=True
-                        )
+                assert torch.allclose(torch.tensor(y), data.y[valid_indices])
 
-                        for epoch in range(n_epochs):
-
-                            if epoch == int(n_epochs * 0.5):
-                                optimizer = torch.optim.AdamW(
-                                    model.parameters(), 
-                                    lr=lr / 5, 
-                                    weight_decay=wd,
-                                    betas=betas_adam,
-                                )
-                            elif epoch == (n_epochs * 0.75):
-                                optimizer = torch.optim.AdamW(
-                                    model.parameters(), 
-                                    lr=lr / 25, 
-                                    weight_decay=wd,
-                                    betas=betas_adam,
-                                )
-
-                            train_loss = train(train_loader, model, optimizer, device)
-                            valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
-
-                            train_losses.append(train_loss)
-                            valid_losses.append(valid_loss)
-
-                            f.write(f" {epoch + 1: >4d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}  {np.mean(valid_std): >10.6f}\n")
-                            f.flush()
-
-                    torch.save(model.state_dict(), model_path)
-
-                if revalidate or not os.path.isfile(valid_results_path):
-                    # load previously trained model
-                    model.load_state_dict(torch.load(model_path))
-                    model.to(device);
-
-                    valid_loader = RandomNodeLoader(
-                        data.subgraph(valid_indices),
-                        num_parts=np.ceil(len(valid_indices) / batch_size),
-                        shuffle=False,
-                        pin_memory=True
-                    )
-
-                    valid_loss, valid_std, p, y, logvar_p  = validate(valid_loader, model, device)
-                    assert len(data.y[valid_indices]) == len(p)
-
-                    # helper function to select the validation indices for 1-d tensors in `data`
-                    # and return as numpy
-                    select_valid = lambda data_tensor: data_tensor[valid_indices].numpy().flatten()
-                    results = pd.DataFrame({
-                        "subhalo_id": select_valid(data.subhalo_id),
-                        "log_Mstar": select_valid(data.y),
-                        f"p_GNN_{mode}": p,
-                        "log_Mhalo_dmo": select_valid(data.x[:, 0]),
-                        "log_Vmax_dmo": select_valid(data.x[:, 1]),
-                        "x_dmo": select_valid(data.pos[:, 0]),
-                        "y_dmo": select_valid(data.pos[:, 1]),
-                        "z_dmo": select_valid(data.pos[:, 2]),
-                        "vx_dmo": select_valid(data.vel[:, 0]),
-                        "vy_dmo": select_valid(data.vel[:, 1]),
-                        "vz_dmo": select_valid(data.vel[:, 2]),
-                        "is_central": select_valid(data.is_central).astype(int),
-                        "log_Mhalo_hydro": select_valid(data.x_hydro[:, 0]),
-                        "log_Vmax_hydro": select_valid(data.x_hydro[:, 1]),
-                        "x_hydro": select_valid(data.pos_hydro[:, 0]),
-                        "y_hydro": select_valid(data.pos_hydro[:, 1]),
-                        "z_hydro": select_valid(data.pos_hydro[:, 2]),
-                        "vx_hydro": select_valid(data.vel_hydro[:, 0]),
-                        "vy_hydro": select_valid(data.vel_hydro[:, 1]),
-                        "vz_hydro": select_valid(data.vel_hydro[:, 2]),
-                        "Rstar_50": select_valid(data.halfmassradius),
-                        "overdensity": select_valid(data.overdensity),
-                        "d_minima": select_valid(data.cw_params[:, 0]),
-                        "d_node": select_valid(data.cw_params[:, 1]),
-                        "d_saddle_1": select_valid(data.cw_params[:, 2]),
-                        "d_saddle_2": select_valid(data.cw_params[:, 3]),
-                        "d_skel": select_valid(data.cw_params[:, 4]),
-                    })
-
-                    assert torch.allclose(torch.tensor(y), data.y[valid_indices])
-
-                    results.to_csv(valid_results_path, index=False)
+                results.to_csv(valid_results_path, index=False)
 
 
 
@@ -924,5 +932,6 @@ if __name__ == "__main__":
     use_loops = args.loops
     mode = args.mode
         
-    for D_link in [0.3, 1, 3, 10]: 
+    for D_link in [3, 1, 0.3, 10]: 
+        print(f"Working on D_link = {D_link}")
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

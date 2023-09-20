@@ -109,9 +109,9 @@ def collate_comparison_results(D_link):
 
 
 if __name__ == "__main__":
-    for D_link in [0.3, 1, 3, 5, 10, 0.5, 1.5, 2, 2.5, 3.5, 4, 7.5,]: 
+    for D_linkconda  in [0.3, 1, 3, 5, 10, 0.5, 1.5, 2, 2.5, 3.5, 4, 7.5,]: 
         gc.collect()
-        
+
         cv_results_fname= f"{ROOT}/results/linking_length_tests/D_link{D_link}/cv-results.parquet"
         if not os.path.isfile(cv_results_fname):
             if verbose: print(f"Collating results for {D_link} Mpc")

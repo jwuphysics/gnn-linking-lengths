@@ -13,8 +13,8 @@ from torch_geometric.nn import (
     global_mean_pool, global_max_pool, global_add_pool
 )
 from torch_geometric.utils import index_to_mask, to_undirected, remove_self_loops
-# from torch_geometric.transforms import IndexToMask
 from torch_cluster import radius_graph
+from torch_scatter import scatter_add
 
 import numpy as np
 import pandas as pd
@@ -50,10 +50,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
 recompile_data = False
-retrain = True
+retrain = False
 revalidate = True
-make_plots = True
-save_models = True
+make_plots = False
+save_models = False
 
 cuts = {
     "minimum_log_stellar_mass": 7.5,
@@ -76,7 +76,7 @@ training_params = dict(
     batch_size=30000,
     n_epochs=1000,
     learning_rate=1e-2,
-    weight_decay=1e-3,
+    weight_decay=1e-2,
     augment=True
 )
 
@@ -84,7 +84,7 @@ model_params = dict(
     n_layers=1,
     n_hidden=64,
     n_latent=16,
-    n_unshared_layers=4,
+    n_unshared_layers=8,
 )
 
 # GNN params
@@ -299,21 +299,27 @@ def make_cosmic_graph(subhalos, D_link):
     # build edge features
     edge_attr = np.concatenate([dist.reshape(-1,1), cos1.reshape(-1,1), cos2.reshape(-1,1), vel_norm.reshape(-1,1), vel_cos1.reshape(-1,1), vel_cos2.reshape(-1,1)], axis=1)
 
-    if use_loops:
-        loops = np.zeros((2,pos.shape[0]),dtype=int)
-        atrloops = np.zeros((pos.shape[0], edge_attr.shape[1]))
-        for i, posit in enumerate(pos):
-            loops[0,i], loops[1,i] = i, i
-            atrloops[i,0], atrloops[i,1], atrloops[i,2] = 0., 1., 0.
-        edge_index = np.append(edge_index, loops, 1)
-        edge_attr = np.append(edge_attr, atrloops, 0)
+    # use loops here no matter what; can always remove later
+    loops = np.zeros((2,pos.shape[0]),dtype=int)
+    atrloops = np.zeros((pos.shape[0], edge_attr.shape[1]))
+    for i, posit in enumerate(pos):
+        loops[0,i], loops[1,i] = i, i
+        atrloops[i,0], atrloops[i,1], atrloops[i,2] = 0., 1., 0.
+    edge_index = np.append(edge_index, loops, 1)
+    edge_attr = np.append(edge_attr, atrloops, 0)
     edge_index = edge_index.astype(int)
 
-    # super slow, probably can be optimized or perhaps parallelized...
-    overdensity = torch.zeros(len(x), dtype=x.dtype)
-    for i in range(len(x)):
-        neighbors = edge_index[1, edge_index[0] == i] # get neighbor indices
-        overdensity[i] = torch.log10((10**x[neighbors, -2]).sum()) # get sum of masses of neighbors (2nd to last index in `x`)
+    # optimized way to compute overdensity
+    source_nodes = edge_index[0]
+    target_nodes = edge_index[1]
+    overdensity = torch.log10(
+        scatter_add(
+            10**(torch.tensor(x[source_nodes, 0])), 
+            index=torch.tensor(target_nodes), 
+            dim=0, 
+            dim_size=len(x)
+        )
+    )
 
     data = Data(
         x=x,
@@ -409,9 +415,9 @@ class EdgeInteractionLayer(MessagePassing):
             nn.Linear(n_in, n_hidden, bias=True),
             nn.LayerNorm(n_hidden),
             act_fn(),
-            # nn.Linear(n_hidden, n_hidden, bias=True),
-            # nn.LayerNorm(n_hidden),
-            # act_fn(),
+            nn.Linear(n_hidden, n_hidden, bias=True),
+            nn.LayerNorm(n_hidden),
+            act_fn(),
             nn.Linear(n_hidden, n_latent, bias=True),
         )
 
@@ -448,7 +454,6 @@ class EdgeInteractionGNN(nn.Module):
         for _ in range(n_layers-1):
             layers += [
                 nn.ModuleList([
-                    # EdgeInteractionLayer(2 * latent_channels * n_unshared_layers + node_features, hidden_channels, latent_channels, aggr=aggr, act_fn=act_fn) 
                     EdgeInteractionLayer(self.n_pool * (2 * latent_channels * n_unshared_layers + node_features), hidden_channels, latent_channels, aggr=aggr, act_fn=act_fn) 
                     for _ in range(n_unshared_layers)
                 ])
@@ -460,20 +465,30 @@ class EdgeInteractionGNN(nn.Module):
             nn.Linear(self.n_pool * n_unshared_layers * latent_channels, hidden_channels, bias=True),
             nn.LayerNorm(hidden_channels),
             act_fn(),
-            # nn.Linear(hidden_channels, hidden_channels, bias=True),
-            # nn.LayerNorm(hidden_channels),
-            # act_fn(),
-            nn.Linear(hidden_channels, n_out, bias=True)
+            nn.Linear(hidden_channels, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            nn.Linear(hidden_channels, latent_channels, bias=True)
         )
 
         self.galaxy_halo_mlp = nn.Sequential(
             nn.Linear(node_features, hidden_channels, bias=True),
             nn.LayerNorm(hidden_channels),
             act_fn(),
-            # nn.Linear(hidden_channels, hidden_channels, bias=True),
-            # nn.LayerNorm(hidden_channels),
-            # act_fn(),
-            nn.Linear(hidden_channels, n_out, bias=True)
+            nn.Linear(hidden_channels, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            nn.Linear(hidden_channels, latent_channels, bias=True)
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(2 * latent_channels, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            nn.Linear(hidden_channels, hidden_channels, bias=True),
+            nn.LayerNorm(hidden_channels),
+            act_fn(),
+            nn.Linear(hidden_channels, 2 * n_out, bias=True)
         )
         
         self.D_link = D_link
@@ -499,8 +514,9 @@ class EdgeInteractionGNN(nn.Module):
             self.h = h
             h = h.relu()
                         
-        return (self.galaxy_environment_mlp(h) + self.galaxy_halo_mlp(data.x))
-                    
+        out =  torch.cat([self.galaxy_environment_mlp(h), self.galaxy_halo_mlp(data.x)], axis=1)
+        return self.fc(out)
+
            
 
 def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e-10):
@@ -541,14 +557,14 @@ def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e
 
 
 def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=3.0):
-    """Assumes that data object in dataloader has 8 columns: x,y,z, vx,vy,vz, Mh, Vmax"""
+    """Train GNN model using Gaussian NLL loss."""
     model.train()
 
     loss_total = 0
     for data in (dataloader):
         if augment: # add random noise
-            data_node_features_scatter = 1e-3 * torch.randn_like(data.x) * torch.std(data.x, dim=0)
-            data_edge_features_scatter = 1e-3 * torch.randn_like(data.edge_attr) * torch.std(data.edge_attr, dim=0)
+            data_node_features_scatter = 3e-4 * torch.randn_like(data.x) * torch.std(data.x, dim=0)
+            data_edge_features_scatter = 3e-4 * torch.randn_like(data.edge_attr) * torch.std(data.edge_attr, dim=0)
             
             data.x += data_node_features_scatter
             data.edge_attr += data_edge_features_scatter
@@ -556,8 +572,10 @@ def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=3.0)
         data.to(device)
 
         optimizer.zero_grad()
-        y_pred = model(data).view(-1, model.n_out)
-        loss = F.mse_loss(y_pred, data.y)
+        y_pred, logvar_pred = model(data).chunk(2, dim=1)
+        y_pred = y_pred.view(-1, model.n_out)
+        logvar_pred = logvar_pred.mean()
+        loss = 0.5 * (F.mse_loss(y_pred, data.y) / 10**logvar_pred + logvar_pred)
 
         loss.backward()
         # use gradient clipping to prevent exploding gradients
@@ -581,8 +599,10 @@ def validate(dataloader, model, device):
     for data in (dataloader):
         with torch.no_grad():
             data.to(device)
-            y_pred = model(data).view(-1, model.n_out)
-            loss = F.mse_loss(y_pred, data.y)
+            y_pred, logvar_pred = model(data).chunk(2, dim=1)
+            y_pred = y_pred.view(-1, model.n_out)
+            logvar_pred = logvar_pred.mean()
+            loss = 0.5 * (F.mse_loss(y_pred, data.y) / 10**logvar_pred + logvar_pred)
 
             loss_total += loss.item()
             y_preds += list(y_pred.detach().cpu().numpy())
@@ -604,8 +624,8 @@ def configure_optimizer(model, lr, wd,):
     """
 
     decay, no_decay = set(), set()
-    yes_wd_modules = (torch.nn.Linear, )
-    no_wd_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+    yes_wd_modules = (nn.Linear, )
+    no_wd_modules = (nn.LayerNorm, )
     for mn, m in model.named_modules():
         for pn, p in m.named_parameters():
             fpn = '%s.%s' % (mn, pn) if mn else pn
@@ -615,16 +635,8 @@ def configure_optimizer(model, lr, wd,):
                 decay.add(fpn)
             elif pn.endswith('weight') and isinstance(m, no_wd_modules):
                 no_decay.add(fpn)
-
-    # validate that we considered every parameter
     param_dict = {pn: p for pn, p in model.named_parameters()}
-    inter_params = decay & no_decay
-    union_params = decay | no_decay
-    assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-    assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                % (str(param_dict.keys() - union_params), )
 
-    # create the pytorch optimizer object
     optim_groups = [
         {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": wd},
         {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.},
@@ -753,7 +765,6 @@ def main(
             subhalos.to_parquet(catalog_path)
 
         # make cosmic graphs
-        
         if os.path.isfile(data_path) and not recompile_data:
             with open(data_path, "rb") as data_file:
                 data = pickle.load(data_file)
@@ -780,17 +791,6 @@ def main(
     # remove self-loops
     if not use_loops:
         data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
-
-        # add a bunch of 1/D, 1/D^2 as features as well
-        data.edge_attr = torch.cat(
-            [
-                data.edge_attr, 
-                (data.edge_attr[:, 0]**-1).view(-1, 1), 
-                (data.edge_attr[:, 0]**-2).view(-1, 1),
-                (data.edge_attr[:, 0]**-3).view(-1, 1),
-            ], 
-            axis=1
-        )
 
     # training
     node_features = data.x.shape[1]
@@ -855,11 +855,11 @@ def main(
                         )
 
                         if epoch == int(n_epochs * 0.25):
-                            optimizer = configure_optimizer(model, lr/4, wd)
+                            optimizer = configure_optimizer(model, lr/5, wd)
                         elif epoch == (n_epochs * 0.5):
-                            optimizer = configure_optimizer(model, lr/16, wd)
+                            optimizer = configure_optimizer(model, lr/25, wd)
                         elif epoch == (n_epochs * 0.75):
-                            optimizer = configure_optimizer(model, lr/64, wd)
+                            optimizer = configure_optimizer(model, lr/125, wd)
 
                         train_loss = train(train_loader, model, optimizer, device)
                         valid_loss, p, y  = validate(valid_loader, model, device)
@@ -868,7 +868,7 @@ def main(
                         valid_losses.append(valid_loss)
 
 
-                        f.write(f" {epoch + 1: >4d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {bs: >5d}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}\n")
+                        f.write(f"{epoch + 1: >4d}    {bs: >5d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}\n")
                         f.flush()
 
                 torch.save(model.state_dict(), model_path)
@@ -932,6 +932,7 @@ if __name__ == "__main__":
     use_loops = args.loops
     mode = args.mode
         
-    for D_link in [3, 1, 0.3, 10]: 
+    # for D_link in [3, 1, 0.3, 10]: 
+    for D_link in [0.5, 1.5, 2, 2.5, 3.5, 4, 5, 7.5]:
         print(f"Working on D_link = {D_link}")
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

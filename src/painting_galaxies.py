@@ -7,11 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import SubsetRandomSampler
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader, DataLoader, RandomNodeLoader, NodeLoader
-from torch_geometric.nn import (
-    MessagePassing, GCNConv, PPFConv, MetaLayer, EdgeConv,
-    global_mean_pool, global_max_pool, global_add_pool
-)
+from torch_geometric.loader import NeighborLoader, DataLoader, RandomNodeLoader, ClusterData, ClusterLoader
+from torch_geometric.nn import MessagePassing, SAGEConv
+
 from torch_geometric.utils import index_to_mask, to_undirected, remove_self_loops
 from torch_cluster import radius_graph
 from torch_scatter import scatter_add
@@ -50,13 +48,13 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ### params for generating data products, visualizations, etc.
 recompile_data = False
-retrain = False
+retrain = True
 revalidate = True
-make_plots = False
-save_models = False
+make_plots = True
+save_models = True
 
 cuts = {
-    "minimum_log_stellar_mass": 7.5,
+    "minimum_log_stellar_mass": 9,
     "minimum_log_halo_mass": 11,
     "minimum_n_star_particles": 50
 }
@@ -72,11 +70,12 @@ normalization_params = dict(
 
 # training and optimization params
 training_params = dict(
-    min_batch_size=1000,
-    batch_size=30000,
+    min_batch_size=128,
+    batch_size=1024,
     n_epochs=1000,
     learning_rate=1e-2,
     weight_decay=1e-2,
+    num_parts=48,
     augment=True
 )
 
@@ -212,6 +211,7 @@ def prepare_subhalos(dmo_link_method="sublink", cuts=cuts):
     
     # reiterate halo mass cuts just in case DMO masses are different...
     subhalos_linked = subhalos_linked[subhalos_linked.subhalo_loghalomass_DMO > cuts["minimum_log_halo_mass"]].copy()
+    subhalos_linked.dropna(inplace=True, axis=0)
 
     return subhalos_linked
 
@@ -406,7 +406,7 @@ def visualize_graph(data, draw_edges=True, projection="3d", edge_index=None, box
 
         
 class EdgeInteractionLayer(MessagePassing):
-    """Interaction network layer with node + edge layers.
+    """Graph interaction layer that combines node & edge features on edges.
     """
     def __init__(self, n_in, n_hidden, n_latent, aggr='sum', act_fn=nn.SiLU):
         super(EdgeInteractionLayer, self).__init__(aggr)
@@ -421,24 +421,19 @@ class EdgeInteractionLayer(MessagePassing):
             nn.Linear(n_hidden, n_latent, bias=True),
         )
 
-        self.messages = 0.
-        self.input = 0.
-
     def forward(self, x, edge_index, edge_attr):
         return self.propagate(edge_index, x=x, edge_attr=edge_attr)
 
     def message(self, x_i, x_j, edge_attr):
+        inputs = torch.cat([x_i, x_j, edge_attr], dim=-1)
+        return self.mlp(inputs)
 
-        self.input = torch.cat([x_i, x_j, edge_attr], dim=-1)
-        self.messages = self.mlp(self.input)
-
-        return self.messages
 
 class EdgeInteractionGNN(nn.Module):
     """Graph net over nodes and edges with multiple unshared layers, and sequential layers with residual connections.
     Self-loops also get their own MLP (i.e. galaxy-halo connection).
     """
-    def __init__(self, n_layers, D_link, node_features=2, edge_features=6, hidden_channels=64, aggr="sum", latent_channels=64, n_out=1, n_unshared_layers=4, loop=True, act_fn=nn.SiLU):
+    def __init__(self, n_layers, node_features=2, edge_features=6, hidden_channels=64, aggr="sum", latent_channels=64, n_out=1, n_unshared_layers=4, act_fn=nn.SiLU):
         super(EdgeInteractionGNN, self).__init__()
 
         self.n_in = 2 * node_features + edge_features 
@@ -490,11 +485,6 @@ class EdgeInteractionGNN(nn.Module):
             act_fn(),
             nn.Linear(hidden_channels, 2 * n_out, bias=True)
         )
-        
-        self.D_link = D_link
-        self.loop = loop
-        self.pooled = 0.
-        self.h = 0.
     
     def forward(self, data):
         
@@ -503,21 +493,52 @@ class EdgeInteractionGNN(nn.Module):
         edge_attr = data.edge_attr
 
         # update hidden state on edge (h, or sometimes e_ij in the text)
-        h = torch.cat([unshared_layer(data.x, edge_index=edge_index, edge_attr=edge_attr) for unshared_layer in self.layers[0]], axis=1)
-        self.h = h
-        h = h.relu()
+        h = torch.cat(
+            [
+                unshared_layer(data.x, edge_index=edge_index, edge_attr=edge_attr)
+                for unshared_layer in self.layers[0]
+            ], 
+            axis=1
+        )
         
         for layer in self.layers[1:]:
             # if multiple layers deep, also use a residual layer
-            h = self.h + torch.cat([unshared_layer(h, edge_index=edge_index, edge_attr=edge_attr) for unshared_layer in layer], axis=1)
-        
-            self.h = h
-            h = h.relu()
+            h += torch.cat(
+                [
+                    unshared_layer(h, edge_index=edge_index, edge_attr=edge_attr) 
+                    for unshared_layer in layer
+                ], 
+                axis=1
+            )
                         
         out =  torch.cat([self.galaxy_environment_mlp(h), self.galaxy_halo_mlp(data.x)], axis=1)
         return self.fc(out)
 
-           
+class SAGEGraphConvNet(torch.nn.Module):
+    """A simple GNN built using SAGEConv layers.
+    """
+    def __init__(self, n_in=3, n_hidden=256, n_out=1):
+        super(SAGEGraphConvNet, self).__init__()
+        self.n_in = n_in
+        self.n_hidden = n_hidden
+        self.n_out = n_out
+        self.conv1 = SAGEConv(self.n_in, self.n_hidden)
+        self.conv2 = SAGEConv(self.n_hidden, self.n_hidden)
+        # self.fc = nn.Linear(n_hidden, n_out, bias=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.n_in + 2 * self.n_hidden, self.n_hidden, bias=True),
+            nn.ReLU(),
+            nn.LayerNorm(self.n_hidden),
+            nn.Linear(self.n_hidden, 2*self.n_out, bias=True)
+        )
+
+    def forward(self, data):
+        x0, edge_index = data.x, data.edge_index
+
+        x1 = self.conv1(x0, edge_index)
+        x2 = self.conv2(F.relu(x1), edge_index)
+        mlp_out = self.mlp(torch.cat([x0, F.relu(x1), F.relu(x2)], dim=-1))
+        return mlp_out       
 
 def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e-10):
     """k must be between `range(0, K)`. 
@@ -556,7 +577,7 @@ def get_train_valid_indices(data, k, K=3, boxsize=205/0.6774, pad=10, epsilon=1e
     return train_indices, valid_indices
 
 
-def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=3.0):
+def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=None):
     """Train GNN model using Gaussian NLL loss."""
     model.train()
 
@@ -569,10 +590,15 @@ def train(dataloader, model, optimizer, device, augment=True, max_grad_norm=3.0)
             data.x += data_node_features_scatter
             data.edge_attr += data_edge_features_scatter
 
+            assert not torch.isnan(data.x).any() 
+            assert not torch.isnan(data.edge_attr).any() 
+
         data.to(device)
 
         optimizer.zero_grad()
         y_pred, logvar_pred = model(data).chunk(2, dim=1)
+        assert not torch.isnan(y_pred).any() and not torch.isnan(logvar_pred).any()
+
         y_pred = y_pred.view(-1, model.n_out)
         logvar_pred = logvar_pred.mean()
         loss = 0.5 * (F.mse_loss(y_pred, data.y) / 10**logvar_pred + logvar_pred)
@@ -802,7 +828,7 @@ def main(
     min_batch_size = training_params["min_batch_size"]
     batch_size = training_params["batch_size"]
     n_epochs = training_params["n_epochs"]
-
+    num_parts = training_params["num_parts"]
 
     for k in range(K):
         model_path = f"{results_path}/models/gnn-{training_params['n_epochs']}-{aggr}-{mode}-fold_{k+1}.pt"
@@ -810,14 +836,13 @@ def main(
         
         if retrain or revalidate or not os.path.isfile(model_path):
 
+            # model = SAGEGraphConvNet(n_in=node_features, n_out=out_features)
             model = EdgeInteractionGNN(
                 node_features=node_features,  # note that there are 3 features counting `is_central`, but this final feature is not in `data.x`
                 edge_features=edge_features, 
                 n_layers=n_layers, 
-                D_link=D_link,
                 hidden_channels=n_hidden,
                 latent_channels=n_latent,
-                loop=use_loops,
                 n_unshared_layers=n_unshared_layers,
                 n_out=out_features,
                 aggr=(["sum", "max", "mean"] if aggr == "multi" else aggr)
@@ -828,11 +853,25 @@ def main(
             
             train_indices, valid_indices = get_train_valid_indices(data, k=k, K=K)
 
-            valid_loader = RandomNodeLoader(
-                data.subgraph(valid_indices),
-                num_parts=np.ceil(len(valid_indices) / batch_size),
+            train_data = ClusterData(
+                data.subgraph(train_indices), 
+                num_parts=num_parts, 
+                recursive=False,
+            )
+            valid_data = ClusterData(
+                data.subgraph(train_indices), 
+                num_parts=num_parts // 2, 
+                recursive=False,
+            )
+            train_loader = ClusterLoader(
+                train_data,
+                shuffle=True,
+                batch_size=1,
+            )
+            valid_loader = ClusterLoader(
+                valid_data,
                 shuffle=False,
-                pin_memory=True,
+                batch_size=2,
             )
 
             gc.collect()
@@ -845,15 +884,6 @@ def main(
                 with open(f'{results_path}/logs/training-{mode}-fold_{k+1}.log', 'a') as f:
 
                     for epoch in range(n_epochs):
-                        # linearly increase batch size
-                        bs = int(np.max([min_batch_size, int(batch_size*(epoch+1)/n_epochs)]))
-                        train_loader = RandomNodeLoader(
-                            data.subgraph(train_indices),
-                            num_parts=np.ceil(len(train_indices) / bs),
-                            shuffle=True,
-                            pin_memory=True
-                        )
-
                         if epoch == int(n_epochs * 0.25):
                             optimizer = configure_optimizer(model, lr/5, wd)
                         elif epoch == (n_epochs * 0.5):
@@ -868,7 +898,7 @@ def main(
                         valid_losses.append(valid_loss)
 
 
-                        f.write(f"{epoch + 1: >4d}    {bs: >5d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}\n")
+                        f.write(f"{epoch + 1: >4d}    {train_loss: >9.5f}    {valid_loss: >9.5f}    {np.sqrt(np.mean((p - y.flatten())**2)): >10.6f}\n")
                         f.flush()
 
                 torch.save(model.state_dict(), model_path)
@@ -931,8 +961,8 @@ if __name__ == "__main__":
     aggr = args.aggr
     use_loops = args.loops
     mode = args.mode
-        
-    # for D_link in [3, 1, 0.3, 10]: 
-    for D_link in [0.5, 1.5, 2, 2.5, 3.5, 4, 5, 7.5]:
+
+    # for D_link in [3]:
+    for D_link in [0.3, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 7.5, 10]:
         print(f"Working on D_link = {D_link}")
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

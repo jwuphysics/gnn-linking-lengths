@@ -1,4 +1,5 @@
-# On galaxy environment distance scales (GNNs and linking lengths)
+# Environmental Length Scales and the Galaxy-Halo Connection
+An exploration of galaxy environments using explainable AI and graph neural networks
 
 ## Data
 

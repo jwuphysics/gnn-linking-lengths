@@ -8,14 +8,36 @@ We make use of the `SUBFIND` snapshot 99 (redshift 0) subhalo catalogs derived f
 
 The most important requirements are `pytorch` and `pytorch-geometric`; check out the [latter's documentation](https://pytorch-geometric.readthedocs.io/en/latest/) for more information about installing it.
 
+Training and interpreting the explainable boosting machine (EBM) models requires the [`interpret`](https://github.com/interpretml/interpret/) and [`shap`](https://github.com/shap/shap) packages.
 
 ## Code
 
-All of the scripts are contained in `./src`. In order to train a graph neural network (GNN) to estimate stellar mass from halo mass, please run `python src/output_linking_length_results.py`.
+All of the GNN code is contained in `./src`, and the full results can be found in `./notebook/results.ipynb`. For example, if you want to train a GNN with multi-aggregation no self-loops to map dark matter only subhalo properties to galaxy stellar masses, then run:
+
+```bash
+python src/painting_galaxies.py --aggr multi --loops 0 --mode dmo
+```
+
+Training the EBM is fairly straightforward, and you can see examples in the notebook, e.g.:
+
+```python
+ebm_hyperparams = {
+    "max_bins": 50000, 
+    "validation_size": 0.3,
+    "interactions": 32,
+}
+
+ebm = ExplainableBoostingRegressor(**ebm_hyperparams)        
+ebm.fit(X_train, y_train)
+
+y_pred = ebm.predict(X_valid)
+```
 
 ## Citation 
 
-If you want to cite this paper, you can do so with the following BibTeX blurb from ADS:
+Stay tuned for a paper!
+
+This work was originally based on a ICML 2023 ML4Astro paper:
 
 ```
 @ARTICLE{2023arXiv230612327W,
@@ -36,7 +58,6 @@ archivePrefix = {arXiv},
 ``` 
 
 ## Acknowledgments
-Some of this code evolved out of [HaloGraphNet](https://github.com/PabloVD/HaloGraphNet) repository ([Villanueva-Domingo et al. 2022](https://ui.adsabs.harvard.edu/abs/2022ApJ...935...30V/abstract)).
 
 This project was made possible by the KITP Program, [*Building a Physical Understanding of Galaxy Evolution with Data-driven Astronomy*
 ](https://www.kitp.ucsb.edu/activities/galevo23) (see also the [website](https://datadrivengalaxyevolution.github.io/)).

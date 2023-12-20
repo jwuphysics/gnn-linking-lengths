@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import SubsetRandomSampler
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader, DataLoader, RandomNodeLoader, ClusterData, ClusterLoader
+from torch_geometric.loader import NeighborLoader, RandomNodeLoader, ClusterData, ClusterLoader
 from torch_geometric.nn import MessagePassing, SAGEConv
 
 from torch_geometric.utils import index_to_mask, to_undirected, remove_self_loops
@@ -70,11 +70,10 @@ normalization_params = dict(
 
 # training and optimization params
 training_params = dict(
-    min_batch_size=128,
-    batch_size=1024,
-    n_epochs=1000,
+    # batch_size=2048,
+    n_epochs=300,
     learning_rate=1e-2,
-    weight_decay=1e-2,
+    weight_decay=1e-4,
     num_parts=48,
     augment=True
 )
@@ -171,7 +170,7 @@ def load_subhalos(hydro=True, normalization_params=normalization_params, cuts=cu
     
     return subhalos
 
-def prepare_subhalos(dmo_link_method="sublink", cuts=cuts):
+def prepare_subhalos(cuts=cuts):
     """Helper function to load subhalos, join to DMO simulation, add cosmic web
     parameters, and impose cuts.
 
@@ -620,7 +619,7 @@ def validate(dataloader, model, device):
 
     y_preds = []
     y_trues = []
-
+    subhalo_ids = []
 
     for data in (dataloader):
         with torch.no_grad():
@@ -633,15 +632,18 @@ def validate(dataloader, model, device):
             loss_total += loss.item()
             y_preds += list(y_pred.detach().cpu().numpy())
             y_trues += list(data.y.detach().cpu().numpy())
+            subhalo_ids += list(data.subhalo_id.detach().cpu().numpy())
 
 
     y_preds = np.concatenate(y_preds)
     y_trues = np.array(y_trues)
+    subhalo_ids = np.array(subhalo_ids)
 
     return (
         loss_total / len(dataloader),
         y_preds,
         y_trues,
+        subhalo_ids
     )
 
 def configure_optimizer(model, lr, wd,):
@@ -825,8 +827,7 @@ def main(
 
     lr = training_params["learning_rate"]
     wd = training_params["weight_decay"]
-    min_batch_size = training_params["min_batch_size"]
-    batch_size = training_params["batch_size"]
+    # batch_size = training_params["batch_size"]
     n_epochs = training_params["n_epochs"]
     num_parts = training_params["num_parts"]
 
@@ -857,21 +858,24 @@ def main(
                 data.subgraph(train_indices), 
                 num_parts=num_parts, 
                 recursive=False,
-            )
-            valid_data = ClusterData(
-                data.subgraph(train_indices), 
-                num_parts=num_parts // 2, 
-                recursive=False,
+                log=False
             )
             train_loader = ClusterLoader(
                 train_data,
                 shuffle=True,
                 batch_size=1,
             )
+            
+            valid_data = ClusterData(
+                data.subgraph(valid_indices), 
+                num_parts=num_parts // 2, 
+                recursive=False,
+                log=False
+            )
             valid_loader = ClusterLoader(
                 valid_data,
-                shuffle=False,
-                batch_size=2,
+                shuffle=True, # doesn't even matter...
+                batch_size=1,
             )
 
             gc.collect()
@@ -892,7 +896,7 @@ def main(
                             optimizer = configure_optimizer(model, lr/125, wd)
 
                         train_loss = train(train_loader, model, optimizer, device)
-                        valid_loss, p, y  = validate(valid_loader, model, device)
+                        valid_loss, p, y, _  = validate(valid_loader, model, device)
 
                         train_losses.append(train_loss)
                         valid_losses.append(valid_loss)
@@ -908,23 +912,22 @@ def main(
                 model.load_state_dict(torch.load(model_path))
                 model.to(device);
 
-                valid_loader = RandomNodeLoader(
-                    data.subgraph(valid_indices),
-                    num_parts=np.ceil(len(valid_indices) / batch_size),
-                    shuffle=False,
-                    pin_memory=True
-                )
-
-                valid_loss, p, y  = validate(valid_loader, model, device)
-                assert len(data.y[valid_indices]) == len(p)
+                valid_loss, p, y, valid_subhalo_ids  = validate(valid_loader, model, device)
+                assert len(data.y[valid_indices]) == len(p)        
 
                 # helper function to select the validation indices for 1-d tensors in `data`
                 # and return as numpy
                 select_valid = lambda data_tensor: data_tensor[valid_indices].numpy().flatten()
+
+                # since the valid ids get shuffled by ClusterData, we need to make sure that the subhalo_id column
+                # is sorted, and then use that to rearrange the GNN predictions 
+                # assert np.allclose(select_valid(data.subhalo_id), np.sort(select_valid(data.subhalo_id)))
+                assert torch.allclose(torch.tensor(y[np.argsort(valid_subhalo_ids)]), data.y[valid_indices])
+
                 results = pd.DataFrame({
                     "subhalo_id": select_valid(data.subhalo_id),
                     "log_Mstar": select_valid(data.y),
-                    f"p_GNN_{mode}": p,
+                    f"p_GNN_{mode}": p[np.argsort(valid_subhalo_ids)],
                     "log_Mhalo_dmo": select_valid(data.x[:, 0]),
                     "log_Vmax_dmo": select_valid(data.x[:, 1]),
                     "x_dmo": select_valid(data.pos[:, 0]),
@@ -951,8 +954,6 @@ def main(
                     "d_skel": select_valid(data.cw_params[:, 4]),
                 })
 
-                assert torch.allclose(torch.tensor(y), data.y[valid_indices])
-
                 results.to_csv(valid_results_path, index=False)
 
 
@@ -962,7 +963,7 @@ if __name__ == "__main__":
     use_loops = args.loops
     mode = args.mode
 
-    # for D_link in [3]:
-    for D_link in [0.3, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 7.5, 10]:
+    for D_link in [0.5, 1.5, 2, 2.5, 3.5, 4, 5, 7.5]:
+    # for D_link in [0.3, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 7.5, 10]:
         print(f"Working on D_link = {D_link}")
         main(D_link=D_link, aggr=aggr, use_loops=use_loops, mode=mode)

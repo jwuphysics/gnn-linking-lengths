@@ -36,26 +36,25 @@ y_pred = ebm.predict(X_valid)
 
 ## Citation 
 
-Stay tuned for a paper!
-
-This work was originally based on a ICML 2023 ML4Astro paper:
-
+Our paper has now been submitted to ApJ! If you use this code, please cite:
 ```
-@ARTICLE{2023arXiv230612327W,
-       author = {{Wu}, John F. and {Kragh Jespersen}, Christian},
-        title = "{Learning the galaxy-environment connection with graph neural networks}",
+@ARTICLE{2024arXiv240207995W,
+       author = {{Wu}, John F. and {Kragh Jespersen}, Christian and {Wechsler}, Risa H.},
+        title = "{How the Galaxy-Halo Connection Depends on Large-Scale Environment}",
       journal = {arXiv e-prints},
-     keywords = {Astrophysics - Instrumentation and Methods for Astrophysics, Astrophysics - Cosmology and Nongalactic Astrophysics, Astrophysics - Astrophysics of Galaxies},
-         year = 2023,
-        month = jun,
-          eid = {arXiv:2306.12327},
-        pages = {arXiv:2306.12327},
+     keywords = {Astrophysics - Astrophysics of Galaxies, Astrophysics - Cosmology and Nongalactic Astrophysics, Astrophysics - Instrumentation and Methods for Astrophysics},
+         year = 2024,
+        month = feb,
+          eid = {arXiv:2402.07995},
+        pages = {arXiv:2402.07995},
 archivePrefix = {arXiv},
-       eprint = {2306.12327},
- primaryClass = {astro-ph.IM},
-       adsurl = {https://ui.adsabs.harvard.edu/abs/2023arXiv230612327W},
+       eprint = {2402.07995},
+ primaryClass = {astro-ph.GA},
+       adsurl = {https://ui.adsabs.harvard.edu/abs/2024arXiv240207995W},
       adsnote = {Provided by the SAO/NASA Astrophysics Data System}
 }
+
+
 ``` 
 
 ## Acknowledgments

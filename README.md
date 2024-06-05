@@ -1,5 +1,5 @@
-# Environmental Length Scales and the Galaxy-Halo Connection
-An exploration of galaxy environments using explainable AI and graph neural networks
+# Galaxy Environment Length Scales
+An exploration of galaxy environments in the context of the galaxy-halo connection using explainable AI and graph neural networks
 
 ## Data
 
